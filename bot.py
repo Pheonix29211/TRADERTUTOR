@@ -307,16 +307,19 @@ def cmd_weekly_now(update: Update, context: CallbackContext):
 @_require_admin
 def cmd_menu(update: Update, context: CallbackContext):
     commands_text = (
-        "📌 *Available Commands*\n\n"
-        "/start – Bot status banner\n"
-        "/scan – Manually scan for a signal (opens only if none active)\n"
-        "/status – Show current trade / cooldown\n"
-        "/daily_now – Send daily recap immediately\n"
-        "/weekly_now – Send weekly recap immediately\n"
-        "/check_data – Test MEXC klines fetch\n"
-        "/help or /menu – This command list"
+        "<b>📋 SpiralBot Command Menu</b>\n\n"
+        "<b>/scan</b> — Manually scan market for new signal<br/>"
+        "<b>/status</b> — Current trade / cooldown<br/>"
+        "<b>/logs</b> — Last 30 trades (wins + losses)<br/>"
+        "<b>/results</b> — Performance stats (win rate, profit, avg R)<br/>"
+        "<b>/last30</b> — Last 30 live trade entries<br/>"
+        "<b>/backtest</b> — Backtest last 7 days (updates AI learning)<br/>"
+        "<b>/check_data</b> — Test MEXC data feed<br/>"
+        "<b>/daily_now</b> — Send daily recap now<br/>"
+        "<b>/weekly_now</b> — Send weekly recap now<br/>"
+        "<b>/menu</b> or <b>/help</b> — Show this menu"
     )
-    update.message.reply_text(commands_text, parse_mode=ParseMode.MARKDOWN)
+    update.message.reply_text(commands_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 @_require_admin
 def cmd_help(update: Update, context: CallbackContext):
