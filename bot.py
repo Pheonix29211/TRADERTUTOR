@@ -308,15 +308,15 @@ def cmd_weekly_now(update: Update, context: CallbackContext):
 def cmd_menu(update: Update, context: CallbackContext):
     commands_text = (
         "<b>📋 SpiralBot Command Menu</b>\n\n"
-        "<b>/scan</b> — Manually scan market for new signal<br/>"
-        "<b>/status</b> — Current trade / cooldown<br/>"
-        "<b>/logs</b> — Last 30 trades (wins + losses)<br/>"
-        "<b>/results</b> — Performance stats (win rate, profit, avg R)<br/>"
-        "<b>/last30</b> — Last 30 live trade entries<br/>"
-        "<b>/backtest</b> — Backtest last 7 days (updates AI learning)<br/>"
-        "<b>/check_data</b> — Test MEXC data feed<br/>"
-        "<b>/daily_now</b> — Send daily recap now<br/>"
-        "<b>/weekly_now</b> — Send weekly recap now<br/>"
+        "<b>/scan</b> — Manually scan market for new signal\n"
+        "<b>/status</b> — Current trade / cooldown\n"
+        "<b>/logs</b> — Last 30 trades (wins + losses)\n"
+        "<b>/results</b> — Performance stats (win rate, profit, avg R)\n"
+        "<b>/last30</b> — Last 30 live trade entries\n"
+        "<b>/backtest</b> — Backtest last 7 days (updates AI learning)\n"
+        "<b>/check_data</b> — Test MEXC data feed\n"
+        "<b>/daily_now</b> — Send daily recap now\n"
+        "<b>/weekly_now</b> — Send weekly recap now\n"
         "<b>/menu</b> or <b>/help</b> — Show this menu"
     )
     update.message.reply_text(commands_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
