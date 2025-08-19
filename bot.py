@@ -1,7 +1,10 @@
 import os, time, math, traceback
 from datetime import datetime, timedelta, timezone
+import os
+from flask import Flask, request
+from telegram import Update
+# you already import Updater, CommandHandler, etc. earlier in your file
 from typing import Optional
-
 import pandas as pd
 from dotenv import load_dotenv
 from telegram import Update, ParseMode
@@ -255,17 +258,29 @@ def main():
     # Weekly recap: Sunday 17:30 UTC (Mon 23:00 IST approx)
     jq.run_daily(weekly_recap, time=time(17,30,0, tzinfo=timezone.utc), days=(6,))  # Sunday
 
-PORT = int(os.environ.get("PORT", 8443))
-TOKEN = os.environ["TOKEN"]
-APP_NAME = os.environ["RENDER_EXTERNAL_HOSTNAME"]  # Render gives you this
+# ---- Flask webhook server for Render/Gunicorn ----
+app = Flask(__name__)
 
-WEBHOOK_URL = f"https://{APP_NAME}/{TOKEN}"
+@app.before_first_request
+def _setup_webhook():
+    # Set Telegram webhook when the server starts
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    token = os.environ["TOKEN"]
+    if host and token:
+        url = f"https://{host}/{token}"
+        try:
+            updater.bot.delete_webhook()
+        except Exception:
+            pass
+        updater.bot.set_webhook(url=url)
 
-updater.start_webhook(
-    listen="0.0.0.0",
-    port=PORT,
-    url_path=TOKEN,
-    webhook_url=WEBHOOK_URL
-)
+@app.route(f"/{os.environ['TOKEN']}", methods=["POST"])
+def telegram_webhook():
+    update = Update.de_json(request.get_json(force=True), updater.bot)
+    updater.dispatcher.process_update(update)
+    return "ok", 200
 
-updater.idle()
+# Optional health check
+@app.route("/", methods=["GET"])
+def index():
+    return "OK", 200
