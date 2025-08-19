@@ -2,16 +2,16 @@
 # Complete webhook-ready Telegram bot (PTB v13 + Flask 3.x) for your ICT DoL system
 
 import os, sys, traceback, time
-from datetime import datetime, timedelta
+from datetime import datetime
 from datetime import time as dtime
 from typing import Optional
 
-# Ensure local modules work on Render (Linux, case-sensitive)
+# Ensure local modules import on Render (Linux, case-sensitive)
 sys.path.append(os.path.dirname(__file__))
 
 from dotenv import load_dotenv
 from flask import Flask, request
-from pytz import UTC  # <-- APScheduler (PTB v13) requires pytz timezones
+from pytz import UTC  # APScheduler in PTB v13 requires pytz timezones
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
@@ -40,10 +40,43 @@ bans = CFPBan()
 detector = DoLDetector(bandit)
 tm = TradeManager()
 
+# ==================== TZ / GUARDS ====================
+
+def safe_utc(ts: datetime) -> datetime:
+    """
+    Return the same timestamp normalized to UTC, handling both naive and tz-aware.
+    Avoids: 'Cannot localize tz-aware Timestamp, use tz_convert for conversions'
+    """
+    try:
+        # pandas Timestamp has .tz_localize/.tz_convert too; this works with python datetime as well
+        if getattr(ts, "tzinfo", None) is None:
+            # naive → localize to UTC
+            # For pandas.Timestamp: ts.tz_localize("UTC"); but to be generic:
+            from pandas import Timestamp
+            if isinstance(ts, Timestamp):
+                return ts.tz_localize("UTC").to_pydatetime()
+            else:
+                # python datetime naive → attach UTC
+                import pytz
+                return pytz.UTC.localize(ts)
+        else:
+            # tz-aware → convert to UTC
+            from pandas import Timestamp
+            if isinstance(ts, Timestamp):
+                return ts.tz_convert("UTC").to_pydatetime()
+            else:
+                return ts.astimezone(UTC)
+    except Exception:
+        # last resort: assume UTC as-is to keep bot alive
+        return ts
+
 # ==================== HELPERS ====================
 
 def _is_admin(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
+    # If ADMIN_CHAT_ID not set yet, allow any user (so you can /start and then set it)
+    if not ADMIN_CHAT_ID or str(ADMIN_CHAT_ID).strip() in ("", "0", "None"):
+        return True
     return str(uid) == str(ADMIN_CHAT_ID)
 
 def _require_admin(func):
@@ -60,13 +93,28 @@ def _require_admin(func):
 def _send(context: CallbackContext, text: str):
     try:
         context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
+            chat_id=ADMIN_CHAT_ID if ADMIN_CHAT_ID else update_or_me(context),
             text=text,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
     except Exception:
         pass
+
+def update_or_me(context: CallbackContext) -> int:
+    """
+    Fallback chat_id if ADMIN_CHAT_ID is unset: return the last update's chat id if available.
+    (Keeps bot usable during initial setup.)
+    """
+    try:
+        if context and getattr(context, "chat_data", None):
+            # not reliable for PTB v13 here; fall back below
+            pass
+    except Exception:
+        pass
+    # No reliable context here in jobs; if ADMIN_CHAT_ID missing, nothing to send to.
+    # For jobs we’ll silently skip sending when ADMIN_CHAT_ID is not set.
+    return int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else 0
 
 def _commentary_entry(sig: Signal) -> str:
     side = "Short" if sig.side == "SELL" else "Long"
@@ -92,12 +140,18 @@ def _commentary_trade_event(st: TradeState, event: str, px: float) -> str:
 
 def scan_once(context: CallbackContext):
     """Scans for new DoL signals on 5m; opens only if no active trade."""
-    # If a trade is active, management loop will take care of it
     if tm.active and not tm.active.closed:
         return
     df5 = get_klines("5", limit=500, include_partial=False)
     if df5 is None or len(df5) < 210:
         return
+    # Guard candle index tz in case caller changed client
+    try:
+        idx = df5.index[-1]
+        _ = safe_utc(idx)
+    except Exception:
+        pass
+
     sig = detector.find(df5, bayes, knn, bandit, bans)
     if not sig:
         return
@@ -105,9 +159,20 @@ def scan_once(context: CallbackContext):
         return
     st = tm.open_from_signal(sig)
     if st:
-        _send(context, _commentary_entry(sig))
-        _send(context, f"Expert: Liquidity swept, displacement confirmed, FVG return in play. "
-                       f"Risk sized to ${RISK_DOLLARS:.0f}. Trade `{st.id}` tracking.")
+        # Only send if admin chat id is known
+        if ADMIN_CHAT_ID:
+            context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=_commentary_entry(sig),
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=(f"Expert: Liquidity swept, displacement confirmed, FVG return in play. "
+                      f"Risk sized to ${RISK_DOLLARS:.0f}. Trade `{st.id}` tracking."),
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
 def manage_once(context: CallbackContext):
     """Manages the active trade every minute (1m + 5m context)."""
@@ -119,17 +184,16 @@ def manage_once(context: CallbackContext):
     if df1 is None or df5 is None or len(df1) < 30 or len(df5) < 50:
         return
 
-    # Optional stretch: we can plug full AI confidence; for runtime safety use moderate prior
+    # Optional stretch: plug full AI confidence later; use moderate prior now
     ai_conf = 0.78
     tm.maybe_stretch(st, ai_conf)
 
     ev = tm.manage(st, df1, df5)
     if not ev:
-        # Advisor (light hazard notices)
-        if not ASSISTANT_MODE:
+        if not ASSISTANT_MODE or not ADMIN_CHAT_ID:
             return
         try:
-            # Coarse checks; (detailed hazard in ai.py if you wire real-time feature vector)
+            # Coarse hazard checks; (detailed hazard is in ai.py)
             cur = float(df1["close"].iloc[-1])
             mae = abs(cur - (st.entry_price or st.entry_ref))
             delta = abs(st.entry_ref - st.stop_px) or 1.0
@@ -143,17 +207,18 @@ def manage_once(context: CallbackContext):
 
             H = 0.32*prob_sl + 0.18*(1-ev_knn) + 0.20*rej_score + 0.12*mae_ratio + 0.12*struct_loss + 0.06*vol_shift
             if H >= ASSISTANT_STRONG:
-                _send(context, "🛑 *Cut Recommended* — risk outweighs hold. Bank discipline now.")
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🛑 *Cut Recommended* — risk outweighs hold. Bank discipline now.", parse_mode=ParseMode.MARKDOWN)
             elif H >= ASSISTANT_CUT:
-                _send(context, "⚠️ *Weakening* — EV_exit > EV_hold. Consider partial or exit.")
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⚠️ *Weakening* — EV_exit > EV_hold. Consider partial or exit.", parse_mode=ParseMode.MARKDOWN)
             elif H >= ASSISTANT_WARN:
-                _send(context, "ℹ️ *Heads-up* — momentum softening; tighten BE buffer.")
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="ℹ️ *Heads-up* — momentum softening; tighten BE buffer.", parse_mode=ParseMode.MARKDOWN)
         except Exception:
             pass
         return
 
     # A management event fired
-    _send(context, _commentary_trade_event(st, ev["event"], ev["price"]))
+    if ADMIN_CHAT_ID:
+        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=_commentary_trade_event(st, ev["event"], ev["price"]), parse_mode=ParseMode.MARKDOWN)
 
     # Close and update bandit if terminal
     if ev["event"] in ("TP2", "SL", "EARLY_TP2"):
@@ -161,25 +226,44 @@ def manage_once(context: CallbackContext):
         R = trade_reward(st, ev["event"])
         bandit.update(st.arm_id, norm_reward(R), weight=1.5 if "TP2" in ev["event"] else 1.0)
 
+# One-per-session dedupe
+_last_session_sent = {"LONDON": None, "NY": None}
+
 def session_commentary(context: CallbackContext):
-    """Lightweight market notes around sessions (IST-friendly)."""
-    now = datetime.utcnow()
+    """Send at most once per session per day (IST-friendly)."""
+    import pytz
+    ist = pytz.timezone(TZ_NAME if TZ_NAME else "Asia/Kolkata")
+    now = datetime.now(ist)
     h = now.hour
-    # IST workaround: message windows; refine if needed
-    if 12 <= h <= 17:
-        _send(context, "📈 London in play: likely liquidity engineering. Watch for sweep → displacement. Sniper mode ON 🔥")
-    if 19 <= h <= 23:
-        _send(context, "⚡️ NY session: breakout probability elevated. Track displacement legs and FVG returns 🚀")
+    day = now.strftime("%Y-%m-%d")
+
+    global _last_session_sent
+    if 12 <= h <= 17:  # London-ish in IST
+        if _last_session_sent.get("LONDON") != day and ADMIN_CHAT_ID:
+            context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="📈 London in play: likely liquidity engineering. Watch for sweep → displacement. Sniper mode ON 🔥")
+            _last_session_sent["LONDON"] = day
+    if 19 <= h <= 23:  # New York-ish
+        if _last_session_sent.get("NY") != day and ADMIN_CHAT_ID:
+            context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⚡️ NY session: breakout probability elevated. Track displacement legs and FVG returns 🚀")
+            _last_session_sent["NY"] = day
 
 def daily_recap(context: CallbackContext):
+    if not ADMIN_CHAT_ID:
+        return
     today = datetime.now().strftime("%Y-%m-%d")
-    _send(context, f"📅 *Daily Recap — {today}*\n"
-                   f"Asia: context logged • London/NY: commentary posted\n"
-                   f"Trades: check logs.\n"
-                   f"🔥 One clean kill > many messy shots.")
+    context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=(f"📅 *Daily Recap — {today}*\n"
+              f"Asia: context logged • London/NY: commentary posted\n"
+              f"Trades: check logs.\n"
+              f"🔥 One clean kill > many messy shots."),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 def weekly_recap(context: CallbackContext):
-    _send(context, "📆 *Weekly Recap*\nWins/Losses, EV improvements, chop avoidance, and session chains summarised. Keep sniping ⚔️")
+    if not ADMIN_CHAT_ID:
+        return
+    context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="📆 *Weekly Recap*\nWins/Losses, EV improvements, chop avoidance, and session chains summarised. Keep sniping ⚔️", parse_mode=ParseMode.MARKDOWN)
 
 # ==================== TELEGRAM COMMANDS ====================
 
@@ -211,15 +295,6 @@ def cmd_status(update: Update, context: CallbackContext):
     update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 @_require_admin
-def cmd_help(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "/start • /scan • /status\n"
-        "/daily_now • /weekly_now\n"
-        "Auto-jobs: manage (1m), scan (2m), session notes (30m), daily/weekly recaps.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-@_require_admin
 def cmd_daily_now(update: Update, context: CallbackContext):
     daily_recap(context)
     update.message.reply_text("Daily recap sent.")
@@ -229,10 +304,42 @@ def cmd_weekly_now(update: Update, context: CallbackContext):
     weekly_recap(context)
     update.message.reply_text("Weekly recap sent.")
 
+@_require_admin
+def cmd_menu(update: Update, context: CallbackContext):
+    commands_text = (
+        "📌 *Available Commands*\n\n"
+        "/start – Bot status banner\n"
+        "/scan – Manually scan for a signal (opens only if none active)\n"
+        "/status – Show current trade / cooldown\n"
+        "/daily_now – Send daily recap immediately\n"
+        "/weekly_now – Send weekly recap immediately\n"
+        "/check_data – Test MEXC klines fetch\n"
+        "/help or /menu – This command list"
+    )
+    update.message.reply_text(commands_text, parse_mode=ParseMode.MARKDOWN)
+
+@_require_admin
+def cmd_help(update: Update, context: CallbackContext):
+    cmd_menu(update, context)
+
+@_require_admin
+def cmd_check_data(update: Update, context: CallbackContext):
+    try:
+        df5 = get_klines("5", limit=10, include_partial=True)
+        if df5 is None or df5.empty:
+            update.message.reply_text("❌ No data from MEXC.")
+            return
+        # Show last candle time safely in UTC
+        ts = safe_utc(df5.index[-1])
+        update.message.reply_text(f"✅ MEXC OK. 5m candles: {len(df5)}. Last bar @ {ts.isoformat()}")
+    except Exception as e:
+        update.message.reply_text(f"❌ MEXC error: {e}")
+
 def error_handler(update: object, context: CallbackContext):
     try:
         msg = f"Error: {context.error}\n{traceback.format_exc()[:900]}"
-        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg)
+        if ADMIN_CHAT_ID:
+            context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg)
     except Exception:
         pass
 
@@ -244,19 +351,21 @@ dp = updater.dispatcher
 jq = updater.job_queue
 
 # Register handlers
-dp.add_handler(CommandHandler("start", cmd_start))
-dp.add_handler(CommandHandler("scan", cmd_scan))
-dp.add_handler(CommandHandler("status", cmd_status))
-dp.add_handler(CommandHandler("help", cmd_help))
-dp.add_handler(CommandHandler("daily_now", cmd_daily_now))
+dp.add_handler(CommandHandler("start",      cmd_start))
+dp.add_handler(CommandHandler("scan",       cmd_scan))
+dp.add_handler(CommandHandler("status",     cmd_status))
+dp.add_handler(CommandHandler("daily_now",  cmd_daily_now))
 dp.add_handler(CommandHandler("weekly_now", cmd_weekly_now))
+dp.add_handler(CommandHandler("check_data", cmd_check_data))
+dp.add_handler(CommandHandler("menu",       cmd_menu))
+dp.add_handler(CommandHandler("help",       cmd_help))
 dp.add_error_handler(error_handler)
 
-# Schedule jobs (note: APScheduler needs pytz tz)
-jq.run_repeating(manage_once, interval=60, first=10)
-jq.run_repeating(scan_once,   interval=120, first=15)
-jq.run_repeating(session_commentary, interval=60*30, first=30)
-jq.run_daily(daily_recap,  time=dtime(17,  0, 0, tzinfo=UTC))           # 17:00 UTC
+# Schedule jobs (apscheduler needs pytz tz)
+jq.run_repeating(manage_once,         interval=60,     first=10)
+jq.run_repeating(scan_once,           interval=120,    first=15)
+jq.run_repeating(session_commentary,  interval=60*30,  first=30)
+jq.run_daily(daily_recap,  time=dtime(17,  0, 0, tzinfo=UTC))            # 17:00 UTC (~22:30 IST)
 jq.run_daily(weekly_recap, time=dtime(17, 30, 0, tzinfo=UTC), days=(6,)) # Sunday 17:30 UTC
 
 # IMPORTANT: In webhook mode we don't call start_polling(), so start JobQueue explicitly
