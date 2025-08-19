@@ -2,7 +2,8 @@
 # Complete webhook-ready Telegram bot (PTB v13 + Flask 3.x) for your ICT DoL system
 
 import os, sys, traceback, time
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, timedelta
+from datetime import time as dtime
 from typing import Optional
 
 # Ensure local modules work on Render (Linux, case-sensitive)
@@ -10,10 +11,11 @@ sys.path.append(os.path.dirname(__file__))
 
 from dotenv import load_dotenv
 from flask import Flask, request
+from pytz import UTC  # <-- APScheduler (PTB v13) requires pytz timezones
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# ---- Local modules (make sure these filenames match exactly) ----
+# ---- Local modules (filenames must match exactly on Linux) ----
 from config import (
     TOKEN, ADMIN_CHAT_ID, TZ_NAME, SYMBOL,
     ASSISTANT_MODE, ASSISTANT_WARN, ASSISTANT_CUT, ASSISTANT_STRONG,
@@ -30,7 +32,7 @@ from indicators import atr
 load_dotenv()
 ensure_dirs()
 
-# Singletons kept small/lightweight for 2GB RAM / 1 CPU
+# Lightweight singletons (fit 2GB RAM / 1 CPU)
 bandit = PolicyArms()
 knn = PatternKNN()
 bayes = BayesModel()
@@ -124,23 +126,21 @@ def manage_once(context: CallbackContext):
     ev = tm.manage(st, df1, df5)
     if not ev:
         # Advisor (light hazard notices)
-        if not ASSISTANT_MODE: 
+        if not ASSISTANT_MODE:
             return
         try:
-            # coarse checks; detailed hazard calc is in ai.py if you want to wire real-time features
+            # Coarse checks; (detailed hazard in ai.py if you wire real-time feature vector)
             cur = float(df1["close"].iloc[-1])
             mae = abs(cur - (st.entry_price or st.entry_ref))
             delta = abs(st.entry_ref - st.stop_px) or 1.0
             mae_ratio = float(min(1.0, mae / delta))
 
-            # heuristic hazard mix (kept light for 1 CPU)
             prob_sl = 0.35
             ev_knn = 0.55
             rej_score = 0.1
             struct_loss = 0.3
             vol_shift = 0.1
 
-            # Inline hazard calc (same functional shape as ai.hazard, but avoid extra import call freq)
             H = 0.32*prob_sl + 0.18*(1-ev_knn) + 0.20*rej_score + 0.12*mae_ratio + 0.12*struct_loss + 0.06*vol_shift
             if H >= ASSISTANT_STRONG:
                 _send(context, "🛑 *Cut Recommended* — risk outweighs hold. Bank discipline now.")
@@ -163,9 +163,9 @@ def manage_once(context: CallbackContext):
 
 def session_commentary(context: CallbackContext):
     """Lightweight market notes around sessions (IST-friendly)."""
-    now = datetime.now(timezone.utc).astimezone()
+    now = datetime.utcnow()
     h = now.hour
-    # IST vibes: adjust messages around your active windows
+    # IST workaround: message windows; refine if needed
     if 12 <= h <= 17:
         _send(context, "📈 London in play: likely liquidity engineering. Watch for sweep → displacement. Sniper mode ON 🔥")
     if 19 <= h <= 23:
@@ -252,14 +252,12 @@ dp.add_handler(CommandHandler("daily_now", cmd_daily_now))
 dp.add_handler(CommandHandler("weekly_now", cmd_weekly_now))
 dp.add_error_handler(error_handler)
 
-# Schedule jobs (adjust times as you like)
+# Schedule jobs (note: APScheduler needs pytz tz)
 jq.run_repeating(manage_once, interval=60, first=10)
 jq.run_repeating(scan_once,   interval=120, first=15)
 jq.run_repeating(session_commentary, interval=60*30, first=30)
-# Daily recap 17:00 UTC (~22:30 IST). Change to your preference.
-jq.run_daily(daily_recap, time=dtime(17,0,0, tzinfo=timezone.utc))
-# Weekly recap Sunday 17:30 UTC
-jq.run_daily(weekly_recap, time=dtime(17,30,0, tzinfo=timezone.utc), days=(6,))
+jq.run_daily(daily_recap,  time=dtime(17,  0, 0, tzinfo=UTC))           # 17:00 UTC
+jq.run_daily(weekly_recap, time=dtime(17, 30, 0, tzinfo=UTC), days=(6,)) # Sunday 17:30 UTC
 
 # IMPORTANT: In webhook mode we don't call start_polling(), so start JobQueue explicitly
 jq.start()
