@@ -257,15 +257,10 @@ def main():
     jq.run_daily(daily_recap, time=time(17,0,0, tzinfo=timezone.utc))
     # Weekly recap: Sunday 17:30 UTC (Mon 23:00 IST approx)
     jq.run_daily(weekly_recap, time=time(17,30,0, tzinfo=timezone.utc), days=(6,))  # Sunday
-# ---- Flask webhook server for Render/Gunicorn (Flask 3.x safe) ----
-import os
-from flask import Flask, request
-from telegram import Update
-
+jq.start()
 app = Flask(__name__)
 
 def setup_webhook_once():
-    """Set Telegram webhook explicitly on startup (Flask 3.x: no before_first_request)."""
     host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     token = os.environ.get("TOKEN")
     if not host or not token:
@@ -277,7 +272,7 @@ def setup_webhook_once():
         pass
     updater.bot.set_webhook(url=url)
 
-# call it at import time (Gunicorn workers=1 recommended)
+# Call after updater exists:
 setup_webhook_once()
 
 @app.route(f"/{os.environ['TOKEN']}", methods=["POST"])
