@@ -1,11 +1,13 @@
 # utils.py
 # Backtest suite using your DoL detector on MEXC data
-# - Paged range fetch (mexc_client.get_klines_between) -> full window (no 1000-bar cap)
+# - Paged range fetch (mexc_client.get_klines_between) -> full window
 # - Safe timezone handling (no tz_localize on tz-aware)
 # - Backtest is lock-free (ignores live trade locks/cooldowns)
-# - SL/TP built from P&L dollars using fixed qty (defaults env or 0.101)
+# - SL from P&L dollars (qty), TP1/TP2 from price points
 # - Persists results to /data/trades.json so /logs shows them
 # - Debug counters (/btdebug) to diagnose “no trades”
+# - NEW: baseline detector tuning slightly eased (lower strictness) to match live
+
 from __future__ import annotations
 
 import os
@@ -55,8 +57,8 @@ _detector_bt = DoLDetector(_bandit_bt)
 # --------- Risk/Qty defaults (env overrideable) ---------
 QTY_BTC      = float(os.getenv("QTY_BTC",      "0.101"))   # fixed position size
 RISK_DOLLARS = float(os.getenv("RISK_DOLLARS", "40"))      # base risk in USD P&L
-TP1_DOLLARS  = float(os.getenv("TP1_DOLLARS",  "600"))     # TP1 reward in USD P&L
-TP2_DOLLARS  = float(os.getenv("TP2_DOLLARS",  "1500"))    # TP2 reward in USD P&L
+TP1_POINTS   = float(os.getenv("TP1_POINTS",   "600"))     # TP1 in price points
+TP2_POINTS   = float(os.getenv("TP2_POINTS",   "1500"))    # TP2 in price points
 
 # --------- Helpers ---------
 def _normalize_index_utc(df: pd.DataFrame) -> pd.DataFrame:
@@ -91,15 +93,18 @@ def _append_log(row: Dict[str, Any]):
     rows.append(row)
     _save_logs(rows)
 
+# --------- Baseline tuning (lower strictness to match live) ---------
+def _baseline_tuning():
+    # Same as bot.py BASELINE tuning
+    return {"disp_mult": 0.92, "fvg_mult": 0.92, "return_mult": 1.05, "conf_adj": -0.03}
+
 # --------- Public API ---------
 def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
     """
     Simulate last `days` of BTCUSDT using DoLDetector on <tf> minute candles.
     Backtest ignores live locks — opens on any detected signal so we can observe frequency.
-    SL/TP are computed from P&L dollars and fixed qty:
-      risk_dist = RISK_DOLLARS / QTY_BTC       (~$396 per $40 risk at 0.101 BTC)
-      tp1_dist  = TP1_DOLLARS  / QTY_BTC       (~$5,940 per $600 reward)
-      tp2_dist  = TP2_DOLLARS  / QTY_BTC       (~$14,851 per $1,500 reward)
+    SL is computed from P&L dollars and fixed qty (RISK_DOLLARS / QTY_BTC).
+    TP1/TP2 are price distances (TP1_POINTS / TP2_POINTS).
     Looks ahead up to 8h for outcome (scaled by timeframe).
     Appends results to /data/trades.json (source='backtest').
     """
@@ -124,14 +129,20 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
     elif tf in ("60", "1h"): tf_minutes = 60
     look_bars = max(12, int(8 * 60 / tf_minutes))  # 8 hours forward
 
-    # Pre-calc distances from P&L dollars & qty
+    # Distances
     risk_dist = RISK_DOLLARS / QTY_BTC
-    tp1_dist  = TP1_DOLLARS  / QTY_BTC
-    tp2_dist  = TP2_DOLLARS  / QTY_BTC
+    tp1_dist  = TP1_POINTS
+    tp2_dist  = TP2_POINTS
+
+    tuning = _baseline_tuning()
 
     for i in range(250, len(df)):
         window = df.iloc[: i + 1]
-        sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
+        # Try with tuning; fallback without if the detector doesn't accept it
+        try:
+            sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt, tuning=tuning)
+        except TypeError:
+            sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
         if not sig:
             continue
 
@@ -139,7 +150,7 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
         side  = getattr(sig, "side", "BUY")
         entry = float(getattr(sig, "entry_ref", last_close))
 
-        # Try levels from signal; fill with P&L-derived distances if missing
+        # Try levels from signal; fill with our rules if missing
         stop_px = getattr(sig, "stop_px", None)
         tp1_px  = getattr(sig, "tp1_px",  None)
         tp2_px  = getattr(sig, "tp2_px",  None)
@@ -151,7 +162,7 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
         if tp2_px is None:
             tp2_px = entry + tp2_dist  if side == "BUY" else entry - tp2_dist
 
-        # Direction sanity (in case signal-provided numbers are inverted)
+        # Direction sanity
         if side == "BUY":
             if stop_px >= entry: stop_px = entry - abs(risk_dist)
             if tp1_px  <= entry: tp1_px  = entry + abs(tp1_dist)
@@ -228,12 +239,16 @@ def backtest_strategy_debug(days: int = 7, tf: str = "5") -> Dict[str, Any]:
             'last_ts': str(df.index[-1]) if bars else None
         }
 
+    tuning = _baseline_tuning()
     tested = 0
     signals = 0
     for i in range(250, len(df)):
         tested += 1
         window = df.iloc[: i + 1]
-        sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
+        try:
+            sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt, tuning=tuning)
+        except TypeError:
+            sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
         if sig:
             signals += 1
 
