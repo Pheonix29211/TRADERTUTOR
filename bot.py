@@ -1,10 +1,18 @@
 # bot.py
-# Complete webhook-ready Telegram bot (PTB v13 + Flask 3.x) for your ICT DoL system
+# Webhook-ready Telegram bot (PTB v13 + Flask 3.x) for your ICT DoL system
+# - MEXC-only data feed (mexc_client.py)
+# - pytz-safe APScheduler jobs
+# - HTML /menu (no Telegram markdown parse issues)
+# - /scan, /status, /check_data, /backtest, /logs
+# - Debug: /btdebug, /diag, /force_unlock
+# - Session commentary (London/NY) with daily dedupe
+# - Trade "dopamine" is handled in strategy/ai; this bot wires notifications + rewards
 
-import os, sys, traceback, time
+import os, sys, traceback, time, json
 from datetime import datetime
 from datetime import time as dtime
-from typing import Optional
+from typing import Optional, List
+from pathlib import Path
 
 # Ensure local modules import on Render (Linux, case-sensitive)
 sys.path.append(os.path.dirname(__file__))
@@ -21,16 +29,28 @@ from config import (
     ASSISTANT_MODE, ASSISTANT_WARN, ASSISTANT_CUT, ASSISTANT_STRONG,
     RISK_DOLLARS, STRETCH_MAX_DOLLARS, TP1_DOLLARS, TP2_DOLLARS,
 )
-from storage import ensure_dirs, daily_maintenance
+# storage.ensure_dirs is fine if you have it; harmless if it's a noop
+try:
+    from storage import ensure_dirs
+except Exception:
+    def ensure_dirs(): pass
+
 from mexc_client import get_klines
 from strategy import DoLDetector, TradeManager, trade_reward, norm_reward, Signal, TradeState
 from ai import PolicyArms, PatternKNN, BayesModel, CFPBan
-from indicators import atr
 
 # ==================== INIT ====================
 
 load_dotenv()
 ensure_dirs()
+
+# Persistent data dir & trade log file (survives redeploys if your Render disk is mounted at /data)
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+TRADES_PATH = os.path.join(DATA_DIR, "trades.json")
+# Guarantee the log file exists so /logs works even before first trade/backtest
+if not Path(TRADES_PATH).exists():
+    Path(TRADES_PATH).write_text("[]", encoding="utf-8")
 
 # Lightweight singletons (fit 2GB RAM / 1 CPU)
 bandit = PolicyArms()
@@ -48,33 +68,27 @@ def safe_utc(ts: datetime) -> datetime:
     Avoids: 'Cannot localize tz-aware Timestamp, use tz_convert for conversions'
     """
     try:
-        # pandas Timestamp has .tz_localize/.tz_convert too; this works with python datetime as well
-        if getattr(ts, "tzinfo", None) is None:
-            # naive → localize to UTC
-            # For pandas.Timestamp: ts.tz_localize("UTC"); but to be generic:
-            from pandas import Timestamp
-            if isinstance(ts, Timestamp):
+        from pandas import Timestamp
+        if isinstance(ts, Timestamp):
+            if ts.tz is None:
                 return ts.tz_localize("UTC").to_pydatetime()
             else:
-                # python datetime naive → attach UTC
+                return ts.tz_convert("UTC").to_pydatetime()
+        else:
+            # python datetime
+            if ts.tzinfo is None:
                 import pytz
                 return pytz.UTC.localize(ts)
-        else:
-            # tz-aware → convert to UTC
-            from pandas import Timestamp
-            if isinstance(ts, Timestamp):
-                return ts.tz_convert("UTC").to_pydatetime()
             else:
                 return ts.astimezone(UTC)
     except Exception:
-        # last resort: assume UTC as-is to keep bot alive
         return ts
 
 # ==================== HELPERS ====================
 
 def _is_admin(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
-    # If ADMIN_CHAT_ID not set yet, allow any user (so you can /start and then set it)
+    # If ADMIN_CHAT_ID not set yet, allow the first user initially
     if not ADMIN_CHAT_ID or str(ADMIN_CHAT_ID).strip() in ("", "0", "None"):
         return True
     return str(uid) == str(ADMIN_CHAT_ID)
@@ -92,29 +106,16 @@ def _require_admin(func):
 
 def _send(context: CallbackContext, text: str):
     try:
+        if not ADMIN_CHAT_ID:
+            return
         context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID if ADMIN_CHAT_ID else update_or_me(context),
+            chat_id=ADMIN_CHAT_ID,
             text=text,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
     except Exception:
         pass
-
-def update_or_me(context: CallbackContext) -> int:
-    """
-    Fallback chat_id if ADMIN_CHAT_ID is unset: return the last update's chat id if available.
-    (Keeps bot usable during initial setup.)
-    """
-    try:
-        if context and getattr(context, "chat_data", None):
-            # not reliable for PTB v13 here; fall back below
-            pass
-    except Exception:
-        pass
-    # No reliable context here in jobs; if ADMIN_CHAT_ID missing, nothing to send to.
-    # For jobs we’ll silently skip sending when ADMIN_CHAT_ID is not set.
-    return int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else 0
 
 def _commentary_entry(sig: Signal) -> str:
     side = "Short" if sig.side == "SELL" else "Long"
@@ -136,6 +137,18 @@ def _commentary_trade_event(st: TradeState, event: str, px: float) -> str:
     if event == "CANCELLED": return f"⛔ **Cancelled** — Pre-entry rejection saved us.\n{base}"
     return f"ℹ️ {base}"
 
+def _read_trades_safe() -> List[dict]:
+    try:
+        if not os.path.exists(TRADES_PATH):
+            return []
+        with open(TRADES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
+    except Exception:
+        return []
+
 # ==================== CORE LOOP FUNCS ====================
 
 def scan_once(context: CallbackContext):
@@ -145,10 +158,10 @@ def scan_once(context: CallbackContext):
     df5 = get_klines("5", limit=500, include_partial=False)
     if df5 is None or len(df5) < 210:
         return
-    # Guard candle index tz in case caller changed client
+
+    # touch the index to ensure tz safety; find() expects regular df5
     try:
-        idx = df5.index[-1]
-        _ = safe_utc(idx)
+        _ = safe_utc(df5.index[-1])
     except Exception:
         pass
 
@@ -157,22 +170,21 @@ def scan_once(context: CallbackContext):
         return
     if not tm.can_open():
         return
+
     st = tm.open_from_signal(sig)
-    if st:
-        # Only send if admin chat id is known
-        if ADMIN_CHAT_ID:
-            context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=_commentary_entry(sig),
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-            context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=(f"Expert: Liquidity swept, displacement confirmed, FVG return in play. "
-                      f"Risk sized to ${RISK_DOLLARS:.0f}. Trade `{st.id}` tracking."),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+    if st and ADMIN_CHAT_ID:
+        context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=_commentary_entry(sig),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(f"Expert: Liquidity swept, displacement confirmed, FVG return in play. "
+                  f"Risk sized to ${RISK_DOLLARS:.0f}. Trade `{st.id}` tracking."),
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 def manage_once(context: CallbackContext):
     """Manages the active trade every minute (1m + 5m context)."""
@@ -184,7 +196,7 @@ def manage_once(context: CallbackContext):
     if df1 is None or df5 is None or len(df1) < 30 or len(df5) < 50:
         return
 
-    # Optional stretch: plug full AI confidence later; use moderate prior now
+    # Optional stretch (confidence from AI policy; here a moderate prior)
     ai_conf = 0.78
     tm.maybe_stretch(st, ai_conf)
 
@@ -193,7 +205,7 @@ def manage_once(context: CallbackContext):
         if not ASSISTANT_MODE or not ADMIN_CHAT_ID:
             return
         try:
-            # Coarse hazard checks; (detailed hazard is in ai.py)
+            # Simple advisory (CPU-light; detailed logic sits in ai.py/strategy)
             cur = float(df1["close"].iloc[-1])
             mae = abs(cur - (st.entry_price or st.entry_ref))
             delta = abs(st.entry_ref - st.stop_px) or 1.0
@@ -220,7 +232,7 @@ def manage_once(context: CallbackContext):
     if ADMIN_CHAT_ID:
         context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=_commentary_trade_event(st, ev["event"], ev["price"]), parse_mode=ParseMode.MARKDOWN)
 
-    # Close and update bandit if terminal
+    # If terminal, close and update bandit
     if ev["event"] in ("TP2", "SL", "EARLY_TP2"):
         tm.close(st, ev["event"], ev["price"])
         R = trade_reward(st, ev["event"])
@@ -310,11 +322,12 @@ def cmd_menu(update: Update, context: CallbackContext):
         "<b>📋 SpiralBot Command Menu</b>\n\n"
         "<b>/scan</b> — Manually scan market for new signal\n"
         "<b>/status</b> — Current trade / cooldown\n"
-        "<b>/logs</b> — Last 30 trades (wins + losses)\n"
-        "<b>/results</b> — Performance stats (win rate, profit, avg R)\n"
-        "<b>/last30</b> — Last 30 live trade entries\n"
-        "<b>/backtest</b> — Backtest last 7 days (updates AI learning)\n"
+        "<b>/logs</b> — Show last 30 saved trades (live/backtest)\n"
+        "<b>/backtest</b> — Backtest last 7 days (writes to logs)\n"
         "<b>/check_data</b> — Test MEXC data feed\n"
+        "<b>/btdebug</b> — Backtest detector counters (debug)\n"
+        "<b>/diag</b> — Data health + cooldown state\n"
+        "<b>/force_unlock</b> — Clear trade lock/cooldown (debug)\n"
         "<b>/daily_now</b> — Send daily recap now\n"
         "<b>/weekly_now</b> — Send weekly recap now\n"
         "<b>/menu</b> or <b>/help</b> — Show this menu"
@@ -332,11 +345,107 @@ def cmd_check_data(update: Update, context: CallbackContext):
         if df5 is None or df5.empty:
             update.message.reply_text("❌ No data from MEXC.")
             return
-        # Show last candle time safely in UTC
         ts = safe_utc(df5.index[-1])
         update.message.reply_text(f"✅ MEXC OK. 5m candles: {len(df5)}. Last bar @ {ts.isoformat()}")
     except Exception as e:
         update.message.reply_text(f"❌ MEXC error: {e}")
+
+@_require_admin
+def cmd_backtest(update: Update, context: CallbackContext):
+    try:
+        update.message.reply_text("⏳ Running backtest for last 7 days...")
+        from utils import backtest_strategy  # local import to avoid circulars
+        results = backtest_strategy(days=7)
+
+        if not results:
+            update.message.reply_text("✅ Backtest complete. No valid setups in last 7 days.")
+            return
+
+        lines = ["📊 Backtest Results (last 7 days):"]
+        for r in results[-10:]:
+            lines.append(
+                f"{r['time']} | {r['symbol']} | {r['side']} @ {r['entry']} "
+                f"SL {r['sl']} TP {r['tp']} → {r['result']}"
+            )
+        update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        update.message.reply_text(f"⚠️ Backtest failed: {e}")
+
+@_require_admin
+def cmd_logs(update: Update, context: CallbackContext):
+    trades = _read_trades_safe()
+    if not trades:
+        update.message.reply_text("No saved trades yet.")
+        return
+    # show last up to 10
+    lines = ["🧾 Last trades:"]
+    for t in trades[-10:]:
+        when = t.get("time", "?")
+        sym = t.get("symbol", SYMBOL)
+        side = t.get("side", "?")
+        ent = t.get("entry", "?")
+        res = t.get("result", t.get("exit_reason", "?"))
+        src = t.get("source", "live")
+        lines.append(f"{when} | {sym} | {side} @ {ent} → {res} ({src})")
+    update.message.reply_text("\n".join(lines))
+
+# ---- NEW DEBUG COMMANDS ----
+
+@_require_admin
+def cmd_btdebug(update: Update, context: CallbackContext):
+    try:
+        from utils import backtest_strategy_debug
+        d = backtest_strategy_debug(days=7)
+        msg = (
+            "🔎 Backtest Debug (7d)\n"
+            f"Bars: {d.get('bars',0)}\n"
+            f"Windows tested: {d.get('windows_tested',0)}\n"
+            f"Signals found: {d.get('signals_found',0)}\n"
+            f"Openable (sim): {d.get('saved_to_logs',0)}\n"
+            f"First bar: {d.get('first_ts')}\n"
+            f"Last bar: {d.get('last_ts')}\n"
+        )
+        update.message.reply_text(msg)
+    except Exception as e:
+        update.message.reply_text(f"btdebug error: {e}")
+
+@_require_admin
+def cmd_diag(update: Update, context: CallbackContext):
+    try:
+        df5 = get_klines("5", limit=500, include_partial=False)
+        df1 = get_klines("1", limit=120, include_partial=True)
+        parts = []
+        if df5 is None or df5.empty:
+            parts.append("5m: ❌ no data")
+        else:
+            ts5 = safe_utc(df5.index[-1])
+            parts.append(f"5m: {len(df5)} bars (last {ts5.isoformat()})")
+        if df1 is None or df1.empty:
+            parts.append("1m: ❌ no data")
+        else:
+            ts1 = safe_utc(df1.index[-1])
+            parts.append(f"1m: {len(df1)} bars (last {ts1.isoformat()})")
+
+        if tm.active and not tm.active.closed:
+            st = tm.active
+            parts.append(f"Active: {st.id} {st.side} @ {st.entry_ref:.2f} SL {st.stop_px:.2f} TP1 {st.tp1_px:.2f} TP2 {st.tp2_px:.2f}")
+        else:
+            left_ms = max(0, tm.cooldown_until_ms - int(time.time()*1000))
+            parts.append(f"No active trade. Cooldown: {left_ms//1000}s")
+
+        update.message.reply_text(" • ".join(parts))
+    except Exception as e:
+        update.message.reply_text(f"diag error: {e}")
+
+@_require_admin
+def cmd_force_unlock(update: Update, context: CallbackContext):
+    try:
+        tm.cooldown_until_ms = 0
+        if tm.active and tm.active.closed:
+            tm.active = None
+        update.message.reply_text("🔓 Trade lock & cooldown cleared.")
+    except Exception as e:
+        update.message.reply_text(f"force_unlock error: {e}")
 
 def error_handler(update: object, context: CallbackContext):
     try:
@@ -354,14 +463,20 @@ dp = updater.dispatcher
 jq = updater.job_queue
 
 # Register handlers
-dp.add_handler(CommandHandler("start",      cmd_start))
-dp.add_handler(CommandHandler("scan",       cmd_scan))
-dp.add_handler(CommandHandler("status",     cmd_status))
-dp.add_handler(CommandHandler("daily_now",  cmd_daily_now))
-dp.add_handler(CommandHandler("weekly_now", cmd_weekly_now))
-dp.add_handler(CommandHandler("check_data", cmd_check_data))
-dp.add_handler(CommandHandler("menu",       cmd_menu))
-dp.add_handler(CommandHandler("help",       cmd_help))
+dp.add_handler(CommandHandler("start",        cmd_start))
+dp.add_handler(CommandHandler("scan",         cmd_scan))
+dp.add_handler(CommandHandler("status",       cmd_status))
+dp.add_handler(CommandHandler("daily_now",    cmd_daily_now))
+dp.add_handler(CommandHandler("weekly_now",   cmd_weekly_now))
+dp.add_handler(CommandHandler("check_data",   cmd_check_data))
+dp.add_handler(CommandHandler("backtest",     cmd_backtest))
+dp.add_handler(CommandHandler("logs",         cmd_logs))
+dp.add_handler(CommandHandler("menu",         cmd_menu))
+dp.add_handler(CommandHandler("help",         cmd_help))
+# Debug
+dp.add_handler(CommandHandler("btdebug",      cmd_btdebug))
+dp.add_handler(CommandHandler("diag",         cmd_diag))
+dp.add_handler(CommandHandler("force_unlock", cmd_force_unlock))
 dp.add_error_handler(error_handler)
 
 # Schedule jobs (apscheduler needs pytz tz)

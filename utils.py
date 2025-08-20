@@ -1,8 +1,9 @@
 # utils.py
-# Backtest runner using your DoL detector on MEXC 5m data
-# - Uses paged range fetcher to cover full window
-# - Safe timezone (no tz_localize on tz-aware)
-# - Persists to /data/trades.json so /logs shows results
+# Backtest suite using your DoL detector on MEXC 5m data
+# - Uses paged range fetcher to fully cover the backtest window
+# - Safe timezone handling (no tz_localize on tz-aware)
+# - Persists results to /data/trades.json so /logs shows them
+# - Plus a debug counter probe (/btdebug) to diagnose “no trades”
 
 from __future__ import annotations
 
@@ -17,8 +18,7 @@ from mexc_client import get_klines_between
 from strategy import DoLDetector, TradeManager
 from ai import PolicyArms, PatternKNN, BayesModel, CFPBan
 
-# Paths (match bot.py)
-/* keep consistent with bot.py */
+# --------- Paths (match bot.py) ---------
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 TRADES_PATH = os.path.join(DATA_DIR, "trades.json")
@@ -26,14 +26,20 @@ if not os.path.exists(TRADES_PATH):
     with open(TRADES_PATH, "w", encoding="utf-8") as f:
         json.dump([], f)
 
-# Backtest-local models (separate from live)
+# --------- Backtest-local models (separate from live) ---------
 _bandit_bt = PolicyArms()
 _knn_bt = PatternKNN()
 _bayes_bt = BayesModel()
 _bans_bt = CFPBan()
 _detector_bt = DoLDetector(_bandit_bt)
 
+
+# --------- Helpers ---------
 def _normalize_index_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure df.index is tz-aware UTC.
+    Never tz_localize on an already-aware index (prevents tz errors).
+    """
     if df is None or df.empty:
         return df
     if df.index.tz is None:
@@ -55,6 +61,7 @@ def _save_logs(rows: List[Dict[str, Any]]):
         with open(TRADES_PATH, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
     except Exception:
+        # keep bot alive on disk hiccups
         pass
 
 def _append_log(row: Dict[str, Any]):
@@ -62,6 +69,8 @@ def _append_log(row: Dict[str, Any]):
     rows.append(row)
     _save_logs(rows)
 
+
+# --------- Public API ---------
 def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
     """
     Simulate last `days` of BTCUSDT on 5m using DoLDetector.
@@ -76,9 +85,8 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
         return []
 
     df5 = _normalize_index_utc(df5)
-    # require history
+    # need enough bars to build context
     if len(df5) < 300:
-        # not enough bars to build context
         return []
 
     tm_bt = TradeManager()
@@ -91,6 +99,7 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
         if not sig:
             continue
 
+        # emulate open (separate manager to not touch live state)
         st = tm_bt.open_from_signal(sig)
         if not st:
             continue
@@ -101,7 +110,8 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
         tp2   = float(getattr(sig, "tp2_px",   entry + 1500.0))
         side  = getattr(sig, "side", "BUY")
 
-        look_ahead = df5.iloc[i : min(i + 48, len(df5))]  # next ~4h
+        # Look-ahead window: next ~4h (48 x 5m bars)
+        look_ahead = df5.iloc[i : min(i + 48, len(df5))]
         outcome = "MISS"
 
         if side == "BUY":
@@ -137,3 +147,61 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
         _append_log(row)
 
     return results
+
+
+# --- DEBUG: count how many times the detector fires in the window ---
+def backtest_strategy_debug(days: int = 7):
+    """
+    Returns a dict with counters so we can diagnose 'no trades':
+      {
+        'bars': <int>,
+        'windows_tested': <int>,
+        'signals_found': <int>,
+        'saved_to_logs': <int>,   # how many would be openable
+        'first_ts': <iso or None>,
+        'last_ts': <iso or None>
+      }
+    """
+    end_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    start_utc = end_utc - pd.Timedelta(days=days)
+
+    df5 = get_klines_between("5", start_utc, end_utc, include_partial=False)
+    if df5 is None or df5.empty:
+        return {'bars': 0, 'windows_tested': 0, 'signals_found': 0, 'saved_to_logs': 0, 'first_ts': None, 'last_ts': None}
+
+    # normalize to UTC (tz-safe)
+    if df5.index.tz is None:
+        df5.index = df5.index.tz_localize("UTC")
+    else:
+        df5.index = df5.index.tz_convert("UTC")
+
+    bars = len(df5)
+    if bars < 300:
+        return {'bars': bars, 'windows_tested': 0, 'signals_found': 0, 'saved_to_logs': 0,
+                'first_ts': str(df5.index[0]) if bars else None, 'last_ts': str(df5.index[-1]) if bars else None}
+
+    tm_bt = TradeManager()
+    signals = 0
+    saved = 0
+    tested = 0
+
+    for i in range(250, len(df5)):
+        tested += 1
+        window = df5.iloc[: i + 1]
+        sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
+        if not sig:
+            continue
+        signals += 1
+
+        st = tm_bt.open_from_signal(sig)
+        if st:
+            saved += 1
+
+    return {
+        'bars': bars,
+        'windows_tested': tested,
+        'signals_found': signals,
+        'saved_to_logs': saved,
+        'first_ts': str(df5.index[0]),
+        'last_ts': str(df5.index[-1])
+    }
