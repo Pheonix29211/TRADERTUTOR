@@ -1,19 +1,21 @@
 # utils.py
-# Backtest suite using your DoL detector on MEXC 5m data
-# - Uses paged range fetcher to cover the full window
+# Backtest suite using your DoL detector on MEXC data
+# - Paged range fetch (mexc_client.get_klines_between) -> full window (no 1000-bar cap)
 # - Safe timezone handling (no tz_localize on tz-aware)
+# - Backtest is lock-free (ignores live trade locks/cooldowns)
 # - Persists results to /data/trades.json so /logs shows them
 # - Debug counters (/btdebug) to diagnose “no trades”
 from __future__ import annotations
 
-import os, json, time
+import os
+import json
 from typing import List, Dict, Any
 from pathlib import Path
 
 import pandas as pd
 
 from mexc_client import get_klines_between
-from strategy import DoLDetector, TradeManager
+from strategy import DoLDetector  # no TradeManager here (lock-free sim)
 from ai import PolicyArms, PatternKNN, BayesModel, CFPBan
 
 # --------- Data dir (with graceful fallback if /data not mounted) ---------
@@ -42,7 +44,7 @@ TRADES_PATH = os.path.join(DATA_DIR, "trades.json")
 if not Path(TRADES_PATH).exists():
     Path(TRADES_PATH).write_text("[]", encoding="utf-8")
 
-# --------- Backtest-local models (separate from live) ---------
+# --------- Backtest-local models (separate from live singletons) ---------
 _bandit_bt = PolicyArms()
 _knn_bt = PatternKNN()
 _bayes_bt = BayesModel()
@@ -51,10 +53,6 @@ _detector_bt = DoLDetector(_bandit_bt)
 
 # --------- Helpers ---------
 def _normalize_index_utc(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure df.index is tz-aware UTC.
-    Never tz_localize on an already-aware index (prevents tz errors).
-    """
     if df is None or df.empty:
         return df
     if df.index.tz is None:
@@ -62,6 +60,9 @@ def _normalize_index_utc(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df.index = df.index.tz_convert("UTC")
     return df
+
+def _utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
 
 def _load_logs() -> List[Dict[str, Any]]:
     try:
@@ -76,7 +77,6 @@ def _save_logs(rows: List[Dict[str, Any]]):
         with open(TRADES_PATH, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
     except Exception:
-        # keep bot alive on disk hiccups
         pass
 
 def _append_log(row: Dict[str, Any]):
@@ -84,70 +84,86 @@ def _append_log(row: Dict[str, Any]):
     rows.append(row)
     _save_logs(rows)
 
-def _utc_now() -> pd.Timestamp:
-    """Return tz-aware UTC now without risky tz_localize."""
-    return pd.Timestamp.now(tz="UTC")
-
 # --------- Public API ---------
-def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
+def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
     """
-    Simulate last `days` of BTCUSDT on 5m using DoLDetector.
-    Returns results and appends them to /data/trades.json (source="backtest").
+    Simulate last `days` of BTCUSDT using DoLDetector on <tf> minute candles.
+    Backtest ignores live locks — opens on any detected signal so we can observe frequency.
+    Defaults used if signal lacks precise levels:
+      - SL: $40 from entry (directional)
+      - TP1: $600, TP2: $1500
+    Looks ahead up to 8h for outcome (scaled by timeframe).
+    Appends results to /data/trades.json (source='backtest').
     """
-    end_utc = _utc_now()                       # tz-aware UTC (safe)
+    end_utc = _utc_now()
     start_utc = end_utc - pd.Timedelta(days=days)
 
-    # Range fetch to truly cover the whole window (more than 1000 bars)
-    df5 = get_klines_between("5", start_utc, end_utc, include_partial=False)
-    if df5 is None or df5.empty:
+    df = get_klines_between(tf, start_utc, end_utc, include_partial=False)
+    if df is None or df.empty:
         return []
 
-    df5 = _normalize_index_utc(df5)
-    if len(df5) < 300:                         # need enough history for detector
+    df = _normalize_index_utc(df)
+    if len(df) < 300:
         return []
 
-    tm_bt = TradeManager()
     results: List[Dict[str, Any]] = []
 
-    # Walk forward candle-by-candle
-    for i in range(250, len(df5)):
-        window = df5.iloc[: i + 1]
+    tf_minutes = 5
+    if tf in ("1", "1m"): tf_minutes = 1
+    elif tf in ("5", "5m"): tf_minutes = 5
+    elif tf in ("15", "15m"): tf_minutes = 15
+    elif tf in ("30", "30m"): tf_minutes = 30
+    elif tf in ("60", "1h"): tf_minutes = 60
+    look_bars = max(12, int(8 * 60 / tf_minutes))  # 8 hours forward
+
+    for i in range(250, len(df)):
+        window = df.iloc[: i + 1]
         sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
         if not sig:
             continue
 
-        # emulate open (separate manager to not touch live state)
-        st = tm_bt.open_from_signal(sig)
-        if not st:
-            continue
+        last_close = float(window["close"].iloc[-1])
 
-        entry = float(getattr(sig, "entry_ref", window["close"].iloc[-1]))
-        sl    = float(getattr(sig, "stop_px",  entry - 50.0))
-        tp1   = float(getattr(sig, "tp1_px",   entry + 600.0))
-        tp2   = float(getattr(sig, "tp2_px",   entry + 1500.0))
-        side  = getattr(sig, "side", "BUY")
+        side = getattr(sig, "side", "BUY")
+        entry = float(getattr(sig, "entry_ref", last_close))
 
-        # Look-ahead window: next ~4h (48 x 5m bars)
-        look_ahead = df5.iloc[i : min(i + 48, len(df5))]
+        risk_dollars = 40.0
+        tp1_dollars = 600.0
+        tp2_dollars = 1500.0
+
+        stop_px = getattr(sig, "stop_px", None)
+        tp1_px  = getattr(sig, "tp1_px",  None)
+        tp2_px  = getattr(sig, "tp2_px",  None)
+
+        if stop_px is None:
+            stop_px = entry - risk_dollars if side == "BUY" else entry + risk_dollars
+        if tp1_px is None:
+            tp1_px = entry + tp1_dollars if side == "BUY" else entry - tp1_dollars
+        if tp2_px is None:
+            tp2_px = entry + tp2_dollars if side == "BUY" else entry - tp2_dollars
+
+        stop_px = float(stop_px); tp1_px = float(tp1_px); tp2_px = float(tp2_px)
+
+        look_ahead = df.iloc[i : min(i + look_bars, len(df))]
         outcome = "MISS"
 
         if side == "BUY":
             for _, row in look_ahead.iterrows():
                 high = float(row["high"]); low = float(row["low"])
-                if low <= sl:
+                if low <= stop_px:
                     outcome = "SL"; break
-                if high >= tp2:
+                if high >= tp2_px:
                     outcome = "TP2"; break
-                if high >= tp1:
+                if high >= tp1_px:
                     outcome = "TP1"; break
         else:
             for _, row in look_ahead.iterrows():
                 high = float(row["high"]); low = float(row["low"])
-                if high >= sl:
+                if high >= stop_px:
                     outcome = "SL"; break
-                if low <= tp2:
+                if low <= tp2_px:
                     outcome = "TP2"; break
-                if low <= tp1:
+                if low <= tp1_px:
                     outcome = "TP1"; break
 
         row = {
@@ -155,9 +171,10 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
             "symbol": "BTCUSDT",
             "side": side,
             "entry": entry,
-            "sl": sl,
-            "tp": tp2 if outcome == "TP2" else tp1,
+            "sl": stop_px,
+            "tp": tp2_px if outcome == "TP2" else tp1_px,
             "result": outcome,
+            "tf": f"{tf}m" if tf.isdigit() else tf,
             "source": "backtest"
         }
         results.append(row)
@@ -165,59 +182,46 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
 
     return results
 
-# --- DEBUG: count how many times the detector fires in the window ---
-def backtest_strategy_debug(days: int = 7):
+def backtest_strategy_debug(days: int = 7, tf: str = "5") -> Dict[str, Any]:
     """
     Returns counters so we can diagnose 'no trades':
       {
         'bars': <int>,
         'windows_tested': <int>,
         'signals_found': <int>,
-        'saved_to_logs': <int>,   # how many would be openable
         'first_ts': <iso or None>,
         'last_ts': <iso or None>
       }
     """
-    end_utc = _utc_now()                       # SAFE tz-aware
+    end_utc = _utc_now()
     start_utc = end_utc - pd.Timedelta(days=days)
 
-    df5 = get_klines_between("5", start_utc, end_utc, include_partial=False)
-    if df5 is None or df5.empty:
-        return {'bars': 0, 'windows_tested': 0, 'signals_found': 0, 'saved_to_logs': 0, 'first_ts': None, 'last_ts': None}
+    df = get_klines_between(tf, start_utc, end_utc, include_partial=False)
+    if df is None or df.empty:
+        return {'bars': 0, 'windows_tested': 0, 'signals_found': 0, 'first_ts': None, 'last_ts': None}
 
-    # normalize to UTC (tz-safe)
-    if df5.index.tz is None:
-        df5.index = df5.index.tz_localize("UTC")
-    else:
-        df5.index = df5.index.tz_convert("UTC")
-
-    bars = len(df5)
+    df = _normalize_index_utc(df)
+    bars = len(df)
     if bars < 300:
-        return {'bars': bars, 'windows_tested': 0, 'signals_found': 0, 'saved_to_logs': 0,
-                'first_ts': str(df5.index[0]) if bars else None, 'last_ts': str(df5.index[-1]) if bars else None}
+        return {
+            'bars': bars, 'windows_tested': 0, 'signals_found': 0,
+            'first_ts': str(df.index[0]) if bars else None,
+            'last_ts': str(df.index[-1]) if bars else None
+        }
 
-    tm_bt = TradeManager()
-    signals = 0
-    saved = 0
     tested = 0
-
-    for i in range(250, len(df5)):
+    signals = 0
+    for i in range(250, len(df)):
         tested += 1
-        window = df5.iloc[: i + 1]
+        window = df.iloc[: i + 1]
         sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
-        if not sig:
-            continue
-        signals += 1
-
-        st = tm_bt.open_from_signal(sig)
-        if st:
-            saved += 1
+        if sig:
+            signals += 1
 
     return {
         'bars': bars,
         'windows_tested': tested,
         'signals_found': signals,
-        'saved_to_logs': saved,
-        'first_ts': str(df5.index[0]),
-        'last_ts': str(df5.index[-1])
+        'first_ts': str(df.index[0]),
+        'last_ts': str(df.index[-1])
     }
