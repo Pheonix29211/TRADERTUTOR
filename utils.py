@@ -1,16 +1,14 @@
 # utils.py
 # Backtest suite using your DoL detector on MEXC 5m data
-# - Uses paged range fetcher to fully cover the backtest window
+# - Uses paged range fetcher to cover the full window
 # - Safe timezone handling (no tz_localize on tz-aware)
 # - Persists results to /data/trades.json so /logs shows them
-# - Plus a debug counter probe (/btdebug) to diagnose “no trades”
-
+# - Debug counters (/btdebug) to diagnose “no trades”
 from __future__ import annotations
 
-import os
-import json
-import time
+import os, json, time
 from typing import List, Dict, Any
+from pathlib import Path
 
 import pandas as pd
 
@@ -18,13 +16,31 @@ from mexc_client import get_klines_between
 from strategy import DoLDetector, TradeManager
 from ai import PolicyArms, PatternKNN, BayesModel, CFPBan
 
-# --------- Paths (match bot.py) ---------
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-os.makedirs(DATA_DIR, exist_ok=True)
+# --------- Data dir (with graceful fallback if /data not mounted) ---------
+def _resolve_data_dir():
+    candidates = [
+        os.getenv("DATA_DIR"),
+        "/data",
+        "/tmp/data",
+        os.path.join(os.path.dirname(__file__), "data"),
+    ]
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            Path(p).mkdir(parents=True, exist_ok=True)
+            t = Path(p) / ".write_test"
+            t.write_text("ok", encoding="utf-8")
+            t.unlink(missing_ok=True)
+            return p
+        except Exception:
+            continue
+    raise RuntimeError("No writable data directory found")
+
+DATA_DIR = _resolve_data_dir()
 TRADES_PATH = os.path.join(DATA_DIR, "trades.json")
-if not os.path.exists(TRADES_PATH):
-    with open(TRADES_PATH, "w", encoding="utf-8") as f:
-        json.dump([], f)
+if not Path(TRADES_PATH).exists():
+    Path(TRADES_PATH).write_text("[]", encoding="utf-8")
 
 # --------- Backtest-local models (separate from live) ---------
 _bandit_bt = PolicyArms()
@@ -32,7 +48,6 @@ _knn_bt = PatternKNN()
 _bayes_bt = BayesModel()
 _bans_bt = CFPBan()
 _detector_bt = DoLDetector(_bandit_bt)
-
 
 # --------- Helpers ---------
 def _normalize_index_utc(df: pd.DataFrame) -> pd.DataFrame:
@@ -69,6 +84,9 @@ def _append_log(row: Dict[str, Any]):
     rows.append(row)
     _save_logs(rows)
 
+def _utc_now() -> pd.Timestamp:
+    """Return tz-aware UTC now without risky tz_localize."""
+    return pd.Timestamp.now(tz="UTC")
 
 # --------- Public API ---------
 def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
@@ -76,7 +94,7 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
     Simulate last `days` of BTCUSDT on 5m using DoLDetector.
     Returns results and appends them to /data/trades.json (source="backtest").
     """
-    end_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    end_utc = _utc_now()                       # tz-aware UTC (safe)
     start_utc = end_utc - pd.Timedelta(days=days)
 
     # Range fetch to truly cover the whole window (more than 1000 bars)
@@ -85,8 +103,7 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
         return []
 
     df5 = _normalize_index_utc(df5)
-    # need enough bars to build context
-    if len(df5) < 300:
+    if len(df5) < 300:                         # need enough history for detector
         return []
 
     tm_bt = TradeManager()
@@ -148,11 +165,10 @@ def backtest_strategy(days: int = 7) -> List[Dict[str, Any]]:
 
     return results
 
-
 # --- DEBUG: count how many times the detector fires in the window ---
 def backtest_strategy_debug(days: int = 7):
     """
-    Returns a dict with counters so we can diagnose 'no trades':
+    Returns counters so we can diagnose 'no trades':
       {
         'bars': <int>,
         'windows_tested': <int>,
@@ -162,7 +178,7 @@ def backtest_strategy_debug(days: int = 7):
         'last_ts': <iso or None>
       }
     """
-    end_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    end_utc = _utc_now()                       # SAFE tz-aware
     start_utc = end_utc - pd.Timedelta(days=days)
 
     df5 = get_klines_between("5", start_utc, end_utc, include_partial=False)
