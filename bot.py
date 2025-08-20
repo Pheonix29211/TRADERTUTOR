@@ -6,7 +6,7 @@
 # - /scan, /status, /check_data, /backtest [days tf], /logs
 # - Debug: /btdebug [days tf], /diag, /force_unlock, /fscheck
 # - Session commentary with daily dedupe
-# - “Dopamine”/learning handled in strategy/ai; this bot wires notifications
+# - Live SL/TP are enforced from P&L dollars (qty-based) immediately after open
 
 import os, sys, traceback, time, json
 from datetime import datetime
@@ -28,6 +28,12 @@ from config import (
     ASSISTANT_MODE, ASSISTANT_WARN, ASSISTANT_CUT, ASSISTANT_STRONG,
     RISK_DOLLARS, STRETCH_MAX_DOLLARS, TP1_DOLLARS, TP2_DOLLARS,
 )
+# Optional qty from config; else env; else default 0.101
+try:
+    from config import QTY_BTC as CFG_QTY_BTC
+except Exception:
+    CFG_QTY_BTC = float(os.getenv("QTY_BTC", "0.101"))
+
 try:
     from storage import ensure_dirs
 except Exception:
@@ -150,6 +156,47 @@ def _read_trades_safe() -> List[dict]:
     except Exception:
         return []
 
+# ==================== P&L→price helpers (live) ====================
+def _dist_from_pnl_usd(pnl_usd: float, qty_btc: float) -> float:
+    if qty_btc <= 0:
+        qty_btc = 0.101
+    return float(abs(pnl_usd) / qty_btc)
+
+def _enforce_levels_from_dollars(st: TradeState, risk_usd: float, tp1_usd: float, tp2_usd: float, qty_btc: float):
+    """
+    Enforce SL/TP based on P&L dollars and qty, correcting direction if needed.
+    """
+    entry = float(st.entry_price or st.entry_ref)
+    risk_dist = _dist_from_pnl_usd(risk_usd, qty_btc)
+    tp1_dist  = _dist_from_pnl_usd(tp1_usd,  qty_btc)
+    tp2_dist  = _dist_from_pnl_usd(tp2_usd,  qty_btc)
+
+    if st.side == "BUY":
+        stop_px = entry - risk_dist
+        tp1_px  = entry + tp1_dist
+        tp2_px  = entry + tp2_dist
+        # keep the “tighter” stop / “farther” targets if strategy already set them sanely
+        if getattr(st, "stop_px", None) is not None:
+            stop_px = min(stop_px, float(st.stop_px))
+        if getattr(st, "tp1_px", None) is not None:
+            tp1_px  = max(tp1_px,  float(st.tp1_px))
+        if getattr(st, "tp2_px", None) is not None:
+            tp2_px  = max(tp2_px,  float(st.tp2_px))
+    else:  # SELL
+        stop_px = entry + risk_dist
+        tp1_px  = entry - tp1_dist
+        tp2_px  = entry - tp2_dist
+        if getattr(st, "stop_px", None) is not None:
+            stop_px = max(stop_px, float(st.stop_px))
+        if getattr(st, "tp1_px", None) is not None:
+            tp1_px  = min(tp1_px,  float(st.tp1_px))
+        if getattr(st, "tp2_px", None) is not None:
+            tp2_px  = min(tp2_px,  float(st.tp2_px))
+
+    st.stop_px = float(stop_px)
+    st.tp1_px  = float(tp1_px)
+    st.tp2_px  = float(tp2_px)
+
 # ==================== CORE LOOP FUNCS ====================
 def scan_once(context: CallbackContext):
     if tm.active and not tm.active.closed:
@@ -165,7 +212,17 @@ def scan_once(context: CallbackContext):
         return
 
     st = tm.open_from_signal(sig)
-    if st and ADMIN_CHAT_ID:
+    if not st:
+        return
+
+    # ---- NEW: enforce P&L-based SL/TP right after open (live) ----
+    try:
+        qty = float(getattr(st, "qty", None) or CFG_QTY_BTC or 0.101)
+        _enforce_levels_from_dollars(st, RISK_DOLLARS, TP1_DOLLARS, TP2_DOLLARS, qty)
+    except Exception:
+        pass
+
+    if ADMIN_CHAT_ID:
         context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=_commentary_entry(sig), parse_mode=ParseMode.MARKDOWN)
         context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=(f"Expert: Liquidity swept, displacement confirmed, FVG return in play. "
                                                                f"Risk sized to ${RISK_DOLLARS:.0f}. Trade `{st.id}` tracking."),
@@ -500,4 +557,3 @@ def telegram_webhook():
 @app.get("/")
 def index():
     return "OK", 200
-

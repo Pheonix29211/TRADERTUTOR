@@ -3,6 +3,7 @@
 # - Paged range fetch (mexc_client.get_klines_between) -> full window (no 1000-bar cap)
 # - Safe timezone handling (no tz_localize on tz-aware)
 # - Backtest is lock-free (ignores live trade locks/cooldowns)
+# - SL/TP built from P&L dollars using fixed qty (defaults env or 0.101)
 # - Persists results to /data/trades.json so /logs shows them
 # - Debug counters (/btdebug) to diagnose “no trades”
 from __future__ import annotations
@@ -51,6 +52,12 @@ _bayes_bt = BayesModel()
 _bans_bt = CFPBan()
 _detector_bt = DoLDetector(_bandit_bt)
 
+# --------- Risk/Qty defaults (env overrideable) ---------
+QTY_BTC      = float(os.getenv("QTY_BTC",      "0.101"))   # fixed position size
+RISK_DOLLARS = float(os.getenv("RISK_DOLLARS", "40"))      # base risk in USD P&L
+TP1_DOLLARS  = float(os.getenv("TP1_DOLLARS",  "600"))     # TP1 reward in USD P&L
+TP2_DOLLARS  = float(os.getenv("TP2_DOLLARS",  "1500"))    # TP2 reward in USD P&L
+
 # --------- Helpers ---------
 def _normalize_index_utc(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -89,9 +96,10 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
     """
     Simulate last `days` of BTCUSDT using DoLDetector on <tf> minute candles.
     Backtest ignores live locks — opens on any detected signal so we can observe frequency.
-    Defaults used if signal lacks precise levels:
-      - SL: $40 from entry (directional)
-      - TP1: $600, TP2: $1500
+    SL/TP are computed from P&L dollars and fixed qty:
+      risk_dist = RISK_DOLLARS / QTY_BTC       (~$396 per $40 risk at 0.101 BTC)
+      tp1_dist  = TP1_DOLLARS  / QTY_BTC       (~$5,940 per $600 reward)
+      tp2_dist  = TP2_DOLLARS  / QTY_BTC       (~$14,851 per $1,500 reward)
     Looks ahead up to 8h for outcome (scaled by timeframe).
     Appends results to /data/trades.json (source='backtest').
     """
@@ -116,6 +124,11 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
     elif tf in ("60", "1h"): tf_minutes = 60
     look_bars = max(12, int(8 * 60 / tf_minutes))  # 8 hours forward
 
+    # Pre-calc distances from P&L dollars & qty
+    risk_dist = RISK_DOLLARS / QTY_BTC
+    tp1_dist  = TP1_DOLLARS  / QTY_BTC
+    tp2_dist  = TP2_DOLLARS  / QTY_BTC
+
     for i in range(250, len(df)):
         window = df.iloc[: i + 1]
         sig = _detector_bt.find(window, _bayes_bt, _knn_bt, _bandit_bt, _bans_bt)
@@ -123,24 +136,30 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
             continue
 
         last_close = float(window["close"].iloc[-1])
-
-        side = getattr(sig, "side", "BUY")
+        side  = getattr(sig, "side", "BUY")
         entry = float(getattr(sig, "entry_ref", last_close))
 
-        risk_dollars = 40.0
-        tp1_dollars = 600.0
-        tp2_dollars = 1500.0
-
+        # Try levels from signal; fill with P&L-derived distances if missing
         stop_px = getattr(sig, "stop_px", None)
         tp1_px  = getattr(sig, "tp1_px",  None)
         tp2_px  = getattr(sig, "tp2_px",  None)
 
         if stop_px is None:
-            stop_px = entry - risk_dollars if side == "BUY" else entry + risk_dollars
+            stop_px = entry - risk_dist if side == "BUY" else entry + risk_dist
         if tp1_px is None:
-            tp1_px = entry + tp1_dollars if side == "BUY" else entry - tp1_dollars
+            tp1_px = entry + tp1_dist  if side == "BUY" else entry - tp1_dist
         if tp2_px is None:
-            tp2_px = entry + tp2_dollars if side == "BUY" else entry - tp2_dollars
+            tp2_px = entry + tp2_dist  if side == "BUY" else entry - tp2_dist
+
+        # Direction sanity (in case signal-provided numbers are inverted)
+        if side == "BUY":
+            if stop_px >= entry: stop_px = entry - abs(risk_dist)
+            if tp1_px  <= entry: tp1_px  = entry + abs(tp1_dist)
+            if tp2_px  <= entry: tp2_px  = entry + abs(tp2_dist)
+        else:
+            if stop_px <= entry: stop_px = entry + abs(risk_dist)
+            if tp1_px  >= entry: tp1_px  = entry - abs(tp1_dist)
+            if tp2_px  >= entry: tp2_px  = entry - abs(tp2_dist)
 
         stop_px = float(stop_px); tp1_px = float(tp1_px); tp2_px = float(tp2_px)
 
