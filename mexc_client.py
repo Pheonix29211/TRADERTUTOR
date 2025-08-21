@@ -1,238 +1,194 @@
 # mexc_client.py
-# Robust MEXC V3 klines fetcher (spot) with:
-# - Safe timezone handling (never tz_localize an aware index)
-# - Resilient HTTPS retries (fixes intermittent SSL issues)
-# - Paged range fetch (startTime + endTime) to exceed 1000-bar cap
-# - Single-page fetch that auto-falls back to range if empty
+# MEXC v3 spot klines utilities for SpiralBot
+# - get_klines: latest N klines (1/5/15/30/60 minutes)
+# - get_klines_between: robust range pager (startTime-only) for backtests
+# Returns pandas.DataFrame with UTC index and columns: open, high, low, close, volume
+
+from __future__ import annotations
 
 import os
-import time
-from typing import Optional, List
+import math
+from typing import Optional
 
 import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
+# ----------------- Config / constants -----------------
+try:
+    from config import SYMBOL, TZ_NAME  # TZ_NAME not required here but kept for completeness
+except Exception:
+    SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+    TZ_NAME = os.getenv("TZ_NAME", "Asia/Kolkata")
 
 MEXC_V3_URL = "https://api.mexc.com/api/v3/klines"
+TIMEOUT_SECS = 12
+
+# Map our tf strings to MEXC intervals
 _MEXC_TF_MAP = {
-    "1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h",
-    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h"
+    "1": "1m", "1m": "1m",
+    "5": "5m", "5m": "5m",
+    "15": "15m", "15m": "15m",
+    "30": "30m", "30m": "30m",
+    "60": "1h", "1h": "1h"
 }
-_MINUTES_PER_IV = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
 
-# ---------------- HTTP session with retries ----------------
-_SESSION: Optional[requests.Session] = None
+# ----------------- Helpers -----------------
+def _ensure_iv(tf: str) -> str:
+    """Normalize timeframe input to MEXC interval."""
+    if tf is None:
+        return "5m"
+    tf = str(tf).strip().lower()
+    return _MEXC_TF_MAP.get(tf, tf if tf.endswith(("m", "h")) else f"{tf}m")
 
-def _reset_session() -> None:
-    global _SESSION
-    try:
-        if _SESSION is not None:
-            _SESSION.close()
-    except Exception:
-        pass
-    _SESSION = None
+def _bar_minutes(iv: str) -> int:
+    return {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}.get(iv, 5)
 
-def _get_session() -> requests.Session:
-    global _SESSION
-    if _SESSION is not None:
-        return _SESSION
-    retry = Retry(
-        total=4, connect=4, read=4,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=1)
-    s = requests.Session()
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    s.headers.update({"User-Agent": "TraderTutor/1.0", "Connection": "close"})
-    _SESSION = s
-    return _SESSION
+def _normalize_utc_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    # open_time is already UTC; ensure tz-aware
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+    return df
 
-def _http_get(url: str, params: dict, timeout: int = 12):
-    s = _get_session()
-    try:
-        return s.get(url, params=params, timeout=timeout)
-    except requests.exceptions.SSLError:
-        _reset_session()
-        s = _get_session()
-        return s.get(url, params=params, timeout=timeout)
-    except requests.exceptions.RequestException:
+def _df_from_raw(raw, include_partial: bool, start_ms: int = None, end_ms: int = None) -> Optional[pd.DataFrame]:
+    """Build dataframe from raw list rows; handle types, UTC index, and partial-bar trimming."""
+    if not isinstance(raw, list) or len(raw) == 0:
         return None
 
-# ---------------- TZ helpers ----------------
-def _to_utc_index(series_ms) -> pd.DatetimeIndex:
-    # ALWAYS tz-aware UTC index
-    return pd.to_datetime(series_ms, unit="ms", utc=True)
+    cols_full = [
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_volume","trade_count",
+        "taker_buy_base","taker_buy_quote","ignore"
+    ]
+    n = len(raw[0])
+    df = pd.DataFrame(raw, columns=cols_full[:n])
 
-def _convert_index(idx: pd.DatetimeIndex, tz_name: str) -> pd.DatetimeIndex:
-    if idx.tz is None:
-        return idx.tz_localize("UTC").tz_convert(tz_name)
-    return idx.tz_convert(tz_name)
+    # numeric
+    for c in ("open","high","low","close","volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    keep = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
-    df = df[keep].copy()
-    for c in keep:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna()
+    # time columns -> UTC
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    if "close_time" in df.columns:
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
 
-# ---------------- Paged range fetch (startTime + endTime) ----------------
-def get_klines_between(
-    tf: str,
-    start_utc: pd.Timestamp,
-    end_utc: pd.Timestamp,
-    include_partial: bool = False
-) -> Optional[pd.DataFrame]:
+    # optional trimming for range bounds
+    if start_ms is not None:
+        df = df[df["open_time"].astype("int64") // 10**6 >= start_ms]
+    if end_ms is not None:
+        df = df[df["open_time"].astype("int64") // 10**6 <  end_ms]
+
+    # partial last bar removal (if requested and we have close_time)
+    if not include_partial and "close_time" in df.columns and len(df):
+        now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+        last_close_ms = int(df["close_time"].iloc[-1].timestamp() * 1000)
+        if last_close_ms > now_ms:
+            df = df.iloc[:-1]
+
+    df = df.set_index("open_time").sort_index()
+    df = df[["open","high","low","close","volume"]].dropna()
+    return _normalize_utc_index(df)
+
+# ----------------- Public API -----------------
+def get_klines(tf: str, limit: int = 500, include_partial: bool = False) -> Optional[pd.DataFrame]:
     """
-    Fetch klines covering [start_utc, end_utc] using paging with BOTH startTime and endTime.
-    Returns tz-aware index in TZ_NAME.
+    Fetch the latest klines window (most recent N bars).
+    Returns DataFrame indexed by UTC open_time with: open, high, low, close, volume.
     """
     try:
-        iv = _MEXC_TF_MAP.get(tf, tf)
+        iv = _ensure_iv(tf)
+        limit = int(max(1, min(int(limit), 1000)))  # MEXC max=1000
 
-        # Normalize bounds to tz-aware UTC
-        if start_utc.tz is None: start_utc = start_utc.tz_localize("UTC")
-        else: start_utc = start_utc.tz_convert("UTC")
-        if end_utc.tz is None: end_utc = end_utc.tz_localize("UTC")
-        else: end_utc = end_utc.tz_convert("UTC")
-
-        mins = _MINUTES_PER_IV.get(iv, 5)
-        step_ms = 1000 * mins * 60 * 1000  # ~1000 bars chunk
-
-        frames: List[pd.DataFrame] = []
-        cursor_ms = int(start_utc.value // 10**6)
-        end_ms = int(end_utc.value // 10**6)
-
-        safety = 0
-        while cursor_ms < end_ms and safety < 300:
-            safety += 1
-            chunk_end = min(cursor_ms + step_ms - 1, end_ms)
-            params = {
-                "symbol": SYMBOL,
-                "interval": iv,
-                "limit": 1000,
-                "startTime": cursor_ms,
-                "endTime": chunk_end
-            }
-            r = _http_get(MEXC_V3_URL, params=params, timeout=15)
-            if r is None or r.status_code != 200:
-                break
-
-            data = r.json()
-            if isinstance(data, dict):
-                data = data.get("data", data.get("kline", []))
-            if not isinstance(data, list) or len(data) == 0:
-                # advance to next chunk anyway to avoid looping
-                cursor_ms = chunk_end + 1
-                continue
-
-            cols_full = [
-                "open_time","open","high","low","close","volume",
-                "close_time","quote_volume","trade_count",
-                "taker_buy_base","taker_buy_quote","ignore"
-            ]
-            n = len(data[0])
-            df = pd.DataFrame(data, columns=cols_full[:n])
-            idx_utc = _to_utc_index(df["open_time"])
-            df.index = idx_utc
-            df = _normalize_cols(df)
-            frames.append(df)
-
-            last_ot = int(data[-1][0])
-            cursor_ms = max(chunk_end + 1, last_ot + 1)
-            time.sleep(0.12)
-
-        if not frames:
+        params = {"symbol": SYMBOL, "interval": iv, "limit": limit}
+        r = requests.get(MEXC_V3_URL, params=params, timeout=TIMEOUT_SECS)
+        if r.status_code != 200:
             return None
 
-        big = pd.concat(frames).sort_index()
-        # Trim to window
-        big = big.loc[
-            (big.index.tz_convert("UTC") >= start_utc) &
-            (big.index.tz_convert("UTC") <= end_utc)
-        ].copy()
-
-        try:
-            big.index = _convert_index(big.index, TZ_NAME)
-        except Exception:
-            pass
-
-        return big if not big.empty else None
+        raw = r.json()
+        df = _df_from_raw(raw, include_partial=include_partial)
+        return df
     except Exception:
         return None
 
-# ---------------- Single page fetch with safe fallback ----------------
-def get_klines(tf: str, limit: int = 200, include_partial: bool = True) -> Optional[pd.DataFrame]:
+def get_klines_between(tf: str, start_utc, end_utc, include_partial: bool = False) -> Optional[pd.DataFrame]:
     """
-    Latest klines (single page). If empty/failed, falls back to a short range fetch.
-    Index returned in TZ_NAME (tz-aware). Columns: open, high, low, close, volume.
+    Robust range fetcher using startTime-only paging (avoids under-returns).
+    Trims to [start_utc, end_utc) and optionally drops partial last kline.
     """
     try:
-        iv = _MEXC_TF_MAP.get(tf, tf)
-        params = {"symbol": SYMBOL, "interval": iv, "limit": int(limit)}
-        r = _http_get(MEXC_V3_URL, params=params, timeout=12)
-        if r is None or r.status_code != 200:
-            return _fallback_range(iv, limit)
+        iv = _ensure_iv(tf)
+        mins = _bar_minutes(iv)
+        bar_ms = mins * 60 * 1000
 
-        data = r.json()
-        if isinstance(data, dict):
-            data = data.get("data", data.get("kline", []))
-        if not isinstance(data, list) or len(data) == 0:
-            return _fallback_range(iv, limit)
+        # Normalize bounds to UTC ms
+        s = pd.Timestamp(start_utc)
+        if s.tz is None: s = s.tz_localize("UTC")
+        else: s = s.tz_convert("UTC")
+        e = pd.Timestamp(end_utc)
+        if e.tz is None: e = e.tz_localize("UTC")
+        else: e = e.tz_convert("UTC")
 
-        cols_full = [
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_volume","trade_count",
-            "taker_buy_base","taker_buy_quote","ignore"
-        ]
-        n = len(data[0])
-        df = pd.DataFrame(data, columns=cols_full[:n])
+        start_ms = int(s.timestamp() * 1000)
+        end_ms   = int(e.timestamp() * 1000)
 
-        if "open_time" not in df.columns:
-            return _fallback_range(iv, limit)
+        def _page(limit: int) -> Optional[pd.DataFrame]:
+            cursor = start_ms
+            last_ot = None
+            out = []
+            while cursor < end_ms:
+                params = {"symbol": SYMBOL, "interval": iv, "limit": int(limit), "startTime": int(cursor)}
+                try:
+                    r = requests.get(MEXC_V3_URL, params=params, timeout=TIMEOUT_SECS)
+                except Exception:
+                    break
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                if not isinstance(data, list) or len(data) == 0:
+                    break
 
-        idx_utc = _to_utc_index(df["open_time"])
+                advanced = False
+                for row in data:
+                    ot = int(row[0])  # open_time ms
+                    if last_ot is not None and ot <= last_ot:
+                        continue
+                    if ot >= end_ms:
+                        advanced = True
+                        break
+                    out.append(row)
+                    last_ot = ot
+                    advanced = True
 
-        # Safer partial-bar handling
-        try:
-            if not include_partial and "close_time" in df.columns and pd.notna(df["close_time"].iloc[-1]):
-                now_utc = pd.Timestamp.now(tz="UTC")
-                last_close = pd.to_datetime(df["close_time"].iloc[-1], unit="ms", utc=True)
-                if last_close > now_utc:
-                    df = df.iloc[:-1, :]
-                    idx_utc = idx_utc[:-1]
-        except Exception:
-            pass
+                # advance cursor (nudge at least one bar)
+                if last_ot is not None:
+                    cursor = last_ot + bar_ms
+                else:
+                    cursor += bar_ms
 
-        if len(df) == 0:
-            return _fallback_range(iv, limit)
+                # if fewer than limit returned, probably near end; avoid tight loop
+                if len(data) < int(limit) and not advanced:
+                    break
 
-        df.index = idx_utc
-        df = _normalize_cols(df)
-        if df.empty:
-            return _fallback_range(iv, limit)
+            if not out:
+                return None
+            # Build DF with bound trimming & partial handling
+            return _df_from_raw(out, include_partial=include_partial, start_ms=start_ms, end_ms=end_ms)
 
-        try:
-            df.index = _convert_index(df.index, TZ_NAME)
-        except Exception:
-            pass
+        # First pass with big pages; if under-returning, fallback to smaller pages
+        df = _page(1000)
+        if df is None:
+            return None
+
+        expected = int(math.floor((end_ms - start_ms) / bar_ms))
+        if expected > 0 and len(df) < 0.8 * expected:
+            df2 = _page(500)
+            if df2 is not None and len(df2) > len(df):
+                df = df2
 
         return df
     except Exception:
-        try:
-            return _fallback_range(_MEXC_TF_MAP.get(tf, tf), limit)
-        except Exception:
-            return None
-
-def _fallback_range(iv: str, limit: int) -> Optional[pd.DataFrame]:
-    """Fetch a small range (~limit bars) ending now as a safety net."""
-    mins = _MINUTES_PER_IV.get(iv, 5)
-    end_utc = pd.Timestamp.now(tz="UTC")
-    start_utc = end_utc - pd.Timedelta(minutes=mins * max(10, min(limit, 1000)))
-    return get_klines_between(iv, start_utc, end_utc, include_partial=False)
+        return None

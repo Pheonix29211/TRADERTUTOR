@@ -1,56 +1,49 @@
 # bot.py
-# Webhook-ready Telegram bot (PTB v13 + Flask 3.x) for your ICT DoL system
+# Webhook-ready Telegram bot (PTB v13 + Flask 3.x)
+# Features:
 # - MEXC-only data feed (mexc_client.py)
-# - pytz-safe APScheduler jobs
-# - HTML /menu (no Telegram markdown parse issues)
-# - /scan, /status, /check_data, /backtest [days tf], /logs
-# - Debug: /btdebug [days tf], /diag, /force_unlock, /fscheck, /aistats
-# - Session commentary with daily dedupe
-# - Live SL/TP enforced from P&L dollars (qty-based) after open
-# - NEW: AI-mode based cooldown after SL + adaptive detector tuning (lower strictness in Baseline)
+# - AI-mode (Q/M/R) with hysteresis; mode-based cooldown after SL
+# - Baseline detector slightly loosened; also scans 15m if 5m has no signal
+# - Scan cadence 60s (manage cadence 60s)
+# - One-trade lock, SL=$40 P&L (stretch to $50 only on high conf), TP1=±$600, TP2=±$1500
+# - Single, full entry message with setup details; live logging to /data/trades.json
+# - Session commentary + daily/weekly recaps
+# - HTML-safe messages (no Telegram parse errors)
+# - Flask webhook; no polling
 
 import os, sys, traceback, time, json, math
 from datetime import datetime
 from datetime import time as dtime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pathlib import Path
 
-# Ensure local modules import
 sys.path.append(os.path.dirname(__file__))
 
 from dotenv import load_dotenv
 from flask import Flask, request
 from pytz import UTC
+import pandas as pd
+
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
 from config import (
     TOKEN, ADMIN_CHAT_ID, TZ_NAME, SYMBOL,
     ASSISTANT_MODE, ASSISTANT_WARN, ASSISTANT_CUT, ASSISTANT_STRONG,
-    RISK_DOLLARS, STRETCH_MAX_DOLLARS, TP1_DOLLARS, TP2_DOLLARS,
+    RISK_DOLLARS, STRETCH_MAX_DOLLARS, TP1_DOLLARS, TP2_DOLLARS
 )
-# Optional qty from config; else env; else default 0.101
 try:
     from config import QTY_BTC as CFG_QTY_BTC
 except Exception:
     CFG_QTY_BTC = float(os.getenv("QTY_BTC", "0.101"))
 
-try:
-    from storage import ensure_dirs
-except Exception:
-    def ensure_dirs(): pass
-
 from mexc_client import get_klines
 from strategy import DoLDetector, TradeManager, trade_reward, norm_reward, Signal, TradeState
 from ai import PolicyArms, PatternKNN, BayesModel, CFPBan
 
-import pandas as pd
-
-# ==================== INIT ====================
+# ----------------- init -----------------
 load_dotenv()
-ensure_dirs()
 
-# --------- Data dir with fallback (works even if /data not mounted) ---------
 def _resolve_data_dir():
     candidates = [
         os.getenv("DATA_DIR"),
@@ -59,8 +52,7 @@ def _resolve_data_dir():
         os.path.join(os.path.dirname(__file__), "data"),
     ]
     for p in candidates:
-        if not p:
-            continue
+        if not p: continue
         try:
             Path(p).mkdir(parents=True, exist_ok=True)
             t = Path(p) / ".write_test"
@@ -76,15 +68,14 @@ TRADES_PATH = os.path.join(DATA_DIR, "trades.json")
 if not Path(TRADES_PATH).exists():
     Path(TRADES_PATH).write_text("[]", encoding="utf-8")
 
-# Lightweight singletons
 bandit = PolicyArms()
-knn = PatternKNN()
-bayes = BayesModel()
-bans = CFPBan()
+knn    = PatternKNN()
+bayes  = BayesModel()
+bans   = CFPBan()
 detector = DoLDetector(bandit)
-tm = TradeManager()
+tm       = TradeManager()
 
-# ==================== TZ / GUARDS ====================
+# ----------------- helpers -----------------
 def safe_utc(ts):
     try:
         from pandas import Timestamp
@@ -101,153 +92,6 @@ def safe_utc(ts):
     except Exception:
         return ts
 
-# ==================== CONFIG: AI-mode cooldown & hold ====================
-COOLDOWN_CAUTIOUS_MIN  = int(os.getenv("COOLDOWN_CAUTIOUS_MIN",  "8"))
-COOLDOWN_BASELINE_MIN  = int(os.getenv("COOLDOWN_BASELINE_MIN",  "7"))
-COOLDOWN_AGGR_MIN      = int(os.getenv("COOLDOWN_AGGR_MIN",      "7"))
-AI_MODE_HOLD_MIN       = int(os.getenv("AI_MODE_HOLD_MIN",       "60"))  # hysteresis (min minutes)
-
-# ==================== AI MODE SCORING ====================
-AI_STATE = {"mode": "BASELINE", "A": 0.5, "last_change_ts": 0.0, "Q": 0.5, "M": 0.5, "R": 0.5}
-
-def _sigmoid(x: float) -> float:
-    try:
-        return 1.0 / (1.0 + math.exp(-x))
-    except OverflowError:
-        return 0.0 if x < 0 else 1.0
-
-def _read_trades_safe() -> List[dict]:
-    try:
-        if not os.path.exists(TRADES_PATH): return []
-        with open(TRADES_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-def _score_Q_from_logs(n: int = 30) -> float:
-    rows = _read_trades_safe()
-    if not rows:
-        return 0.5
-    recent = rows[-n:]
-    s = 0.0; cnt = 0
-    for r in recent:
-        res = str(r.get("result","")).upper()
-        if res in ("TP1","TP2","EARLY_TP1","EARLY_TP2"): s += 1.0; cnt += 1
-        elif res in ("SL",): s -= 1.0; cnt += 1
-        elif res in ("MISS",): cnt += 1
-    if cnt == 0:
-        return 0.5
-    x = s / cnt  # [-1,1]
-    return 0.5 + 0.5 * x  # [0,1]
-
-def _score_R_from_logs() -> float:
-    rows = _read_trades_safe()
-    if not rows:
-        return 0.3
-    last8  = rows[-8:]
-    last4  = rows[-4:]
-    sl8 = sum(1 for r in last8 if str(r.get("result","")).upper()=="SL")
-    sl4 = sum(1 for r in last4 if str(r.get("result","")).upper()=="SL")
-    base = 0.15 * sl8  # up to 1.2
-    cluster = 0.4 if sl4 >= 2 else 0.0
-    return float(min(1.0, base + cluster))
-
-def _score_M_from_market() -> float:
-    df = get_klines("5", limit=300, include_partial=True)
-    if df is None or len(df) < 80:
-        return 0.5
-    close = df["close"].astype(float).copy()
-    # ema & atr
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    hl = (df["high"] - df["low"]).abs().astype(float)
-    atr14 = hl.rolling(14).mean()
-    with pd.option_context('mode.use_inf_as_na', True):
-        atr_ratio = (atr14 / close).fillna(0)
-
-    # trend slope proxy
-    spread = ema20 - ema50
-    slope = (spread.iloc[-1] - spread.iloc[-20]) / max(1.0, 20.0)
-    slope_norm = float(max(0.0, min(1.0, abs(slope) / (0.002 * close.iloc[-1]))))  # ~0–1
-
-    # healthy volatility zone around ~0.7% ATR/close
-    ar = float((atr14.iloc[-1] / close.iloc[-1]) if close.iloc[-1] != 0 else 0)
-    if ar <= 0:
-        vol_score = 0.3
-    else:
-        vol_score = math.exp(-((ar - 0.007) ** 2) / (2 * (0.006 ** 2)))
-        vol_score = float(max(0.0, min(1.0, vol_score)))
-
-    # wickiness penalty (noise): body/true-range ratio
-    body = (df["close"] - df["open"]).abs().astype(float)
-    tr = (df["high"] - df["low"]).astype(float)
-    with pd.option_context('mode.use_inf_as_na', True):
-        br = (body.rolling(20).mean() / tr.rolling(20).mean()).fillna(0.0)
-    noise_penalty = float(max(0.0, min(0.4, 0.4 * (1.0 - float(br.iloc[-1])))))
-
-    raw = 0.6 * slope_norm + 0.6 * vol_score - noise_penalty
-    return float(max(0.0, min(1.0, raw)))
-
-def _decide_mode(Q: float, M: float, R: float):
-    A = _sigmoid(1.1*Q + 0.9*M - 0.7*R - 0.1)
-    prev_mode = AI_STATE["mode"]
-    now = time.time()
-    hold_ok = (now - AI_STATE.get("last_change_ts", 0)) >= AI_MODE_HOLD_MIN * 60
-
-    to_caut = A < (0.35 if prev_mode != "CAUTIOUS" else 0.38)
-    to_aggr = A > (0.65 if prev_mode != "AGGRESSIVE" else 0.62)
-
-    new_mode = prev_mode
-    if hold_ok:
-        if to_caut: new_mode = "CAUTIOUS"
-        elif to_aggr: new_mode = "AGGRESSIVE"
-        else: new_mode = "BASELINE"
-
-    changed = (new_mode != prev_mode) and hold_ok
-    if changed:
-        AI_STATE["last_change_ts"] = now
-    AI_STATE.update({"mode": new_mode, "A": float(A), "Q": float(Q), "M": float(M), "R": float(R)})
-    return changed
-
-def refresh_ai_mode(context: CallbackContext = None, announce: bool = True):
-    try:
-        Q = _score_Q_from_logs()
-        M = _score_M_from_market()
-        R = _score_R_from_logs()
-        changed = _decide_mode(Q, M, R)
-        if changed and announce and ADMIN_CHAT_ID:
-            mode = AI_STATE["mode"]; A = AI_STATE["A"]
-            if mode == "CAUTIOUS":
-                spec = f"disp +15%, fvg +10%, return −5%, gate +0.07; cooldown={COOLDOWN_CAUTIOUS_MIN}m"
-            elif mode == "AGGRESSIVE":
-                spec = f"disp −15%, fvg −12%, return +8%, gate −0.05; cooldown={COOLDOWN_AGGR_MIN}m"
-            else:
-                spec = f"baseline eased: disp −8%, fvg −8%, return +5%, gate −0.03; cooldown={COOLDOWN_BASELINE_MIN}m"
-            context.bot.send_message(chat_id=ADMIN_CHAT_ID,
-                                     text=f"🧠 AI Mode: {mode} (A={A:.2f}) — {spec}",
-                                     parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
-
-def _current_tuning():
-    """
-    Returns tuning dict used by the detector (lower strictness in Baseline).
-    Keys:
-      - disp_mult: multiply displacement threshold
-      - fvg_mult:  multiply minimum FVG size
-      - return_mult: multiply return zone width
-      - conf_adj:   additive adjustment to confidence floor
-    """
-    m = AI_STATE["mode"]
-    if m == "CAUTIOUS":
-        return {"disp_mult": 1.15, "fvg_mult": 1.10, "return_mult": 0.95, "conf_adj": +0.07}
-    if m == "AGGRESSIVE":
-        return {"disp_mult": 0.85, "fvg_mult": 0.88, "return_mult": 1.08, "conf_adj": -0.05}
-    # BASELINE — eased a bit (your request to lower strictness)
-    return {"disp_mult": 0.92, "fvg_mult": 0.92, "return_mult": 1.05, "conf_adj": -0.03}
-
-# ==================== HELPERS ====================
 def _is_admin(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
     if not ADMIN_CHAT_ID or str(ADMIN_CHAT_ID).strip() in ("", "0", "None"):
@@ -263,29 +107,170 @@ def _require_admin(func):
         return func(update, context, *a, **kw)
     return wrapper
 
-def _send(context: CallbackContext, text: str):
+def _read_trades_safe() -> List[dict]:
     try:
-        if not ADMIN_CHAT_ID:
-            return
-        context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
+        if not os.path.exists(TRADES_PATH): return []
+        with open(TRADES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _save_trades(rows: List[dict]):
+    try:
+        with open(TRADES_PATH, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-def _commentary_entry(sig: Signal) -> str:
-    side = "Short" if sig.side == "SELL" else "Long"
-    return (
-        f"🎯 **Entry lined up** — *{side}* on `{SYMBOL}`\n"
-        f"• Risk: ${RISK_DOLLARS:.0f} (stretch ≤ ${STRETCH_MAX_DOLLARS:.0f})\n"
-        f"• TP1: +${TP1_DOLLARS:.0f} • TP2: +${TP2_DOLLARS:.0f}\n"
-        f"• Reason: {sig.reason}\n"
-        f"• Confidence: {sig.conf:.2f}"
-    )
+def _append_trade(row: dict):
+    rows = _read_trades_safe()
+    rows.append(row)
+    _save_trades(rows)
 
+def _now_iso_utc():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _p(v, nd=2):
+    try: return f"{float(v):.{nd}f}"
+    except Exception: return str(v)
+
+# ----------------- AI mode scoring -----------------
+COOLDOWN_CAUTIOUS_MIN  = int(os.getenv("COOLDOWN_CAUTIOUS_MIN",  "8"))
+COOLDOWN_BASELINE_MIN  = int(os.getenv("COOLDOWN_BASELINE_MIN",  "7"))
+COOLDOWN_AGGR_MIN      = int(os.getenv("COOLDOWN_AGGR_MIN",      "7"))
+AI_MODE_HOLD_MIN       = int(os.getenv("AI_MODE_HOLD_MIN",       "60"))
+
+AI_STATE = {"mode": "BASELINE", "A": 0.5, "last_change_ts": 0.0, "Q": 0.5, "M": 0.5, "R": 0.5}
+
+def _sigmoid(x: float) -> float:
+    try: return 1.0 / (1.0 + math.exp(-x))
+    except OverflowError: return 0.0 if x < 0 else 1.0
+
+def _score_Q_from_logs(n: int = 30) -> float:
+    rows = _read_trades_safe()
+    if not rows: return 0.5
+    recent = rows[-n:]
+    s = 0.0; cnt = 0
+    for r in recent:
+        res = str(r.get("result","")).upper()
+        if res in ("TP1","TP2","EARLY_TP1","EARLY_TP2"): s += 1.0; cnt += 1
+        elif res in ("SL",): s -= 1.0; cnt += 1
+        elif res in ("MISS", "OPEN"): cnt += 1
+    if cnt == 0: return 0.5
+    x = s / cnt
+    return 0.5 + 0.5 * x
+
+def _score_R_from_logs() -> float:
+    rows = _read_trades_safe()
+    if not rows: return 0.3
+    last8 = rows[-8:]; last4 = rows[-4:]
+    sl8 = sum(1 for r in last8 if str(r.get("result","")).upper()=="SL")
+    sl4 = sum(1 for r in last4 if str(r.get("result","")).upper()=="SL")
+    base = 0.15 * sl8
+    cluster = 0.4 if sl4 >= 2 else 0.0
+    return float(min(1.0, base + cluster))
+
+def _score_M_from_market() -> float:
+    df = get_klines("5", limit=300, include_partial=True)
+    if df is None or len(df) < 80: return 0.5
+    close = df["close"].astype(float).copy()
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    hl = (df["high"] - df["low"]).abs().astype(float)
+    atr14 = hl.rolling(14).mean()
+    with pd.option_context('mode.use_inf_as_na', True):
+        atr_ratio = (atr14 / close).fillna(0)
+    spread = ema20 - ema50
+    slope = (spread.iloc[-1] - spread.iloc[-20]) / 20.0
+    slope_norm = float(max(0.0, min(1.0, abs(slope) / (0.002 * max(1.0, close.iloc[-1])))))
+    ar = float((atr14.iloc[-1] / max(1.0, close.iloc[-1])))
+    if ar <= 0: vol_score = 0.3
+    else:
+        vol_score = math.exp(-((ar - 0.007) ** 2) / (2 * (0.006 ** 2)))
+        vol_score = float(max(0.0, min(1.0, vol_score)))
+    body = (df["close"] - df["open"]).abs().astype(float)
+    tr = (df["high"] - df["low"]).astype(float)
+    with pd.option_context('mode.use_inf_as_na', True):
+        br = (body.rolling(20).mean() / tr.rolling(20).mean()).fillna(0.0)
+    noise_penalty = float(max(0.0, min(0.4, 0.4 * (1.0 - float(br.iloc[-1])))))
+    raw = 0.6 * slope_norm + 0.6 * vol_score - noise_penalty
+    return float(max(0.0, min(1.0, raw)))
+
+def _decide_mode(Q: float, M: float, R: float):
+    A = _sigmoid(1.1*Q + 0.9*M - 0.7*R - 0.1)
+    prev = AI_STATE["mode"]
+    now  = time.time()
+    hold_ok = (now - AI_STATE.get("last_change_ts",0)) >= AI_MODE_HOLD_MIN*60
+    to_caut = A < (0.35 if prev != "CAUTIOUS" else 0.38)
+    to_aggr = A > (0.65 if prev != "AGGRESSIVE" else 0.62)
+    new_mode = prev
+    if hold_ok:
+        if to_caut: new_mode = "CAUTIOUS"
+        elif to_aggr: new_mode = "AGGRESSIVE"
+        else: new_mode = "BASELINE"
+    changed = (new_mode != prev) and hold_ok
+    if changed: AI_STATE["last_change_ts"] = now
+    AI_STATE.update({"mode": new_mode, "A": float(A), "Q": float(Q), "M": float(M), "R": float(R)})
+    return changed
+
+def refresh_ai_mode(context: CallbackContext = None, announce: bool = True):
+    try:
+        Q = _score_Q_from_logs(); M = _score_M_from_market(); R = _score_R_from_logs()
+        changed = _decide_mode(Q,M,R)
+        if changed and announce and ADMIN_CHAT_ID:
+            mode = AI_STATE["mode"]; A = AI_STATE["A"]
+            if mode == "CAUTIOUS":
+                spec = f"disp +15%, fvg +10%, return −5%, gate +0.07; cooldown={COOLDOWN_CAUTIOUS_MIN}m"
+            elif mode == "AGGRESSIVE":
+                spec = f"disp −15%, fvg −12%, return +8%, gate −0.05; cooldown={COOLDOWN_AGGR_MIN}m"
+            else:
+                spec = f"baseline eased: disp −12%, fvg −10%, return +10%, gate −0.06; cooldown={COOLDOWN_BASELINE_MIN}m"
+            context.bot.send_message(chat_id=ADMIN_CHAT_ID,
+                                     text=f"🧠 AI Mode: {mode} (A={A:.2f}) — {spec}",
+                                     parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+def _current_tuning() -> Dict[str, float]:
+    """
+    Tuning multipliers for detector thresholds.
+    BASELINE intentionally loosened to increase entry frequency a bit.
+    """
+    m = AI_STATE["mode"]
+    if m == "CAUTIOUS":
+        return {"disp_mult": 1.15, "fvg_mult": 1.10, "return_mult": 0.95, "conf_adj": +0.07}
+    if m == "AGGRESSIVE":
+        return {"disp_mult": 0.85, "fvg_mult": 0.88, "return_mult": 1.08, "conf_adj": -0.05}
+    # BASELINE — slightly looser now
+    return {"disp_mult": 0.88, "fvg_mult": 0.90, "return_mult": 1.10, "conf_adj": -0.06}
+
+# ----------------- P&L → price distances -----------------
+def _dist_from_pnl_usd(pnl_usd: float, qty_btc: float) -> float:
+    if qty_btc <= 0: qty_btc = 0.101
+    return float(abs(pnl_usd) / qty_btc)
+
+def _enforce_levels_from_dollars(st: TradeState, risk_usd: float, tp1_pts: float, tp2_pts: float, qty_btc: float):
+    entry = float(st.entry_price or st.entry_ref)
+    risk_dist = _dist_from_pnl_usd(risk_usd, qty_btc)
+    tp1_dist  = float(tp1_pts); tp2_dist = float(tp2_pts)
+    if st.side == "BUY":
+        stop_px = entry - risk_dist
+        tp1_px  = entry + tp1_dist
+        tp2_px  = entry + tp2_dist
+        if getattr(st,"stop_px",None) is not None: stop_px = min(stop_px,float(st.stop_px))
+        if getattr(st,"tp1_px",None)  is not None: tp1_px  = max(tp1_px, float(st.tp1_px))
+        if getattr(st,"tp2_px",None)  is not None: tp2_px  = max(tp2_px, float(st.tp2_px))
+    else:
+        stop_px = entry + risk_dist
+        tp1_px  = entry - tp1_dist
+        tp2_px  = entry - tp2_dist
+        if getattr(st,"stop_px",None) is not None: stop_px = max(stop_px,float(st.stop_px))
+        if getattr(st,"tp1_px",None)  is not None: tp1_px  = min(tp1_px, float(st.tp1_px))
+        if getattr(st,"tp2_px",None)  is not None: tp2_px  = min(tp2_px, float(st.tp2_px))
+    st.stop_px = float(stop_px); st.tp1_px = float(tp1_px); st.tp2_px = float(tp2_px)
+
+# ----------------- commentary builders -----------------
 def _commentary_trade_event(st: TradeState, event: str, px: float) -> str:
     base = f"`{st.id}` {event} @ ${px:,.2f}"
     if event == "TP1":       return f"✅ **TP1 HIT** — +$600 bag secured 🔥\n{base}"
@@ -296,43 +281,30 @@ def _commentary_trade_event(st: TradeState, event: str, px: float) -> str:
     if event == "CANCELLED": return f"⛔ **Cancelled** — Pre-entry rejection saved us.\n{base}"
     return f"ℹ️ {base}"
 
-# ==================== P&L→price helpers (live) ====================
-def _dist_from_pnl_usd(pnl_usd: float, qty_btc: float) -> float:
-    if qty_btc <= 0:
-        qty_btc = 0.101
-    return float(abs(pnl_usd) / qty_btc)
+# ----------------- core loops -----------------
+def _full_setup_text(sig: Signal) -> str:
+    """Builds extra setup lines if available on the signal."""
+    try:
+        meta = getattr(sig, "meta", {}) or {}
+        sweep = meta.get("swept_level") or getattr(sig, "swept_level", None)
+        fvg_lo = meta.get("fvg_low") or getattr(sig, "fvg_low", None)
+        fvg_hi = meta.get("fvg_high") or getattr(sig, "fvg_high", None)
+        disp   = meta.get("disp_size") or getattr(sig, "disp_size", None)
+        ote_lo = meta.get("ote_low") or getattr(sig, "ote_low", None)
+        ote_hi = meta.get("ote_high") or getattr(sig, "ote_high", None)
+        parts = []
+        if sweep is not None: parts.append(f"Swept: <b>{_p(sweep)}</b>")
+        if fvg_lo is not None and fvg_hi is not None: parts.append(f"FVG: <b>{_p(fvg_lo)}</b>–<b>{_p(fvg_hi)}</b>")
+        if disp is not None: parts.append(f"Displacement: <b>{_p(disp)}</b>")
+        if ote_lo is not None and ote_hi is not None: parts.append(f"OTE: <b>{_p(ote_lo)}</b>–<b>{_p(ote_hi)}</b>")
+        if parts:
+            return " • ".join(parts)
+        return "Pattern: sweep → displacement → FVG return"
+    except Exception:
+        return "Pattern: sweep → displacement → FVG return"
 
-def _enforce_levels_from_dollars(st: TradeState, risk_usd: float, tp1_pts: float, tp2_pts: float, qty_btc: float):
-    """
-    Enforce SL from P&L dollars and TP1/TP2 as price points, correcting direction if needed.
-    """
-    entry = float(st.entry_price or st.entry_ref)
-    risk_dist = _dist_from_pnl_usd(risk_usd, qty_btc)
-    tp1_dist  = float(tp1_pts)
-    tp2_dist  = float(tp2_pts)
-
-    if st.side == "BUY":
-        stop_px = entry - risk_dist
-        tp1_px  = entry + tp1_dist
-        tp2_px  = entry + tp2_dist
-        if getattr(st, "stop_px", None) is not None: stop_px = min(stop_px, float(st.stop_px))
-        if getattr(st, "tp1_px", None)  is not None: tp1_px  = max(tp1_px,  float(st.tp1_px))
-        if getattr(st, "tp2_px", None)  is not None: tp2_px  = max(tp2_px,  float(st.tp2_px))
-    else:
-        stop_px = entry + risk_dist
-        tp1_px  = entry - tp1_dist
-        tp2_px  = entry - tp2_dist
-        if getattr(st, "stop_px", None) is not None: stop_px = max(stop_px, float(st.stop_px))
-        if getattr(st, "tp1_px", None)  is not None: tp1_px  = min(tp1_px,  float(st.tp1_px))
-        if getattr(st, "tp2_px", None)  is not None: tp2_px  = min(tp2_px,  float(st.tp2_px))
-
-    st.stop_px = float(stop_px)
-    st.tp1_px  = float(tp1_px)
-    st.tp2_px  = float(tp2_px)
-
-# ==================== CORE LOOP FUNCS ====================
 def scan_once(context: CallbackContext):
-    # refresh AI mode first (adapts tuning)
+    # Refresh AI mode for current tuning
     refresh_ai_mode(context, announce=False)
 
     if tm.active and not tm.active.closed:
@@ -341,15 +313,21 @@ def scan_once(context: CallbackContext):
     df5 = get_klines("5", limit=500, include_partial=False)
     if df5 is None or len(df5) < 210:
         return
-    try: _ = safe_utc(df5.index[-1])
-    except Exception: pass
 
     tuning = _current_tuning()
-    # Call detector with tuning if supported; else fallback
     try:
         sig = detector.find(df5, bayes, knn, bandit, bans, tuning=tuning)
     except TypeError:
         sig = detector.find(df5, bayes, knn, bandit, bans)
+
+    # If no 5m signal, try 15m
+    if not sig:
+        df15 = get_klines("15", limit=400, include_partial=False)
+        if df15 is not None and len(df15) >= 210:
+            try:
+                sig = detector.find(df15, bayes, knn, bandit, bans, tuning=tuning)
+            except TypeError:
+                sig = detector.find(df15, bayes, knn, bandit, bans)
 
     if not sig or not tm.can_open():
         return
@@ -358,18 +336,39 @@ def scan_once(context: CallbackContext):
     if not st:
         return
 
-    # Enforce P&L-based SL and price-based TP1/TP2 live
+    # Enforce levels per your rules
     try:
         qty = float(getattr(st, "qty", None) or CFG_QTY_BTC or 0.101)
         _enforce_levels_from_dollars(st, RISK_DOLLARS, 600.0, 1500.0, qty)
     except Exception:
         pass
 
+    # Persist OPEN
+    _append_trade({
+        "time": _now_iso_utc(),
+        "symbol": SYMBOL,
+        "side": st.side,
+        "entry": float(st.entry_ref),
+        "sl": float(st.stop_px),
+        "tp1": float(st.tp1_px),
+        "tp2": float(st.tp2_px),
+        "result": "OPEN",
+        "tf": "5m",
+        "source": "live"
+    })
+
+    # Single, full entry message (HTML)
     if ADMIN_CHAT_ID:
-        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=_commentary_entry(sig), parse_mode=ParseMode.MARKDOWN)
-        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=(f"Expert: Liquidity swept, displacement confirmed, FVG return in play. "
-                                                               f"Risk sized to ${RISK_DOLLARS:.0f}. Trade `{st.id}` tracking."),
-                                  parse_mode=ParseMode.MARKDOWN)
+        setup_lines = _full_setup_text(sig)
+        txt = (
+            f"🎯 <b>ENTRY LIVE</b> — <code>{st.side}</code> on <code>{SYMBOL}</code>\n"
+            f"Entry <b>{_p(st.entry_ref)}</b> | SL <b>{_p(st.stop_px)}</b> | "
+            f"TP1 <b>{_p(st.tp1_px)}</b> | TP2 <b>{_p(st.tp2_px)}</b>\n"
+            f"Risk: ${RISK_DOLLARS:.0f} (stretch ≤ ${STRETCH_MAX_DOLLARS:.0f})\n"
+            f"{setup_lines}\n"
+            f"Confidence: {_p(getattr(sig,'conf',0.0),2)}"
+        )
+        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 def manage_once(context: CallbackContext):
     if not (tm.active and not tm.active.closed):
@@ -392,15 +391,14 @@ def manage_once(context: CallbackContext):
             mae = abs(cur - (st.entry_price or st.entry_ref))
             delta = abs(st.entry_ref - st.stop_px) or 1.0
             mae_ratio = float(min(1.0, mae / delta))
-
             prob_sl = 0.35; ev_knn = 0.55; rej_score = 0.1; struct_loss = 0.3; vol_shift = 0.1
             H = 0.32*prob_sl + 0.18*(1-ev_knn) + 0.20*rej_score + 0.12*mae_ratio + 0.12*struct_loss + 0.06*vol_shift
             if H >= ASSISTANT_STRONG:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🛑 *Cut Recommended* — risk outweighs hold. Bank discipline now.", parse_mode=ParseMode.MARKDOWN)
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🛑 <b>Cut Recommended</b> — risk outweighs hold. Bank discipline now.", parse_mode=ParseMode.HTML)
             elif H >= ASSISTANT_CUT:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⚠️ *Weakening* — EV_exit > EV_hold. Consider partial or exit.", parse_mode=ParseMode.MARKDOWN)
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⚠️ <b>Weakening</b> — EV_exit > EV_hold. Consider partial or exit.", parse_mode=ParseMode.HTML)
             elif H >= ASSISTANT_WARN:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="ℹ️ *Heads-up* — momentum softening; tighten BE buffer.", parse_mode=ParseMode.MARKDOWN)
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="ℹ️ <b>Heads-up</b> — momentum softening; tighten BE buffer.", parse_mode=ParseMode.HTML)
         except Exception:
             pass
         return
@@ -408,28 +406,39 @@ def manage_once(context: CallbackContext):
     if ADMIN_CHAT_ID:
         context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=_commentary_trade_event(st, ev["event"], ev["price"]), parse_mode=ParseMode.MARKDOWN)
 
-    if ev["event"] in ("TP2", "SL", "EARLY_TP2"):
-        tm.close(st, ev["event"], ev["price"])
+    if ev["event"] in ("TP2", "SL", "EARLY_TP2", "TP1", "EARLY_TP1", "CANCELLED"):
+        # close in manager for TP2/SL/EarlyTP2 (others may be partials in your manager)
+        if ev["event"] in ("TP2", "SL", "EARLY_TP2"): tm.close(st, ev["event"], ev["price"])
         R = trade_reward(st, ev["event"])
         bandit.update(st.arm_id, norm_reward(R), weight=1.5 if "TP2" in ev["event"] else 1.0)
 
-        # --- AI-mode dependent cooldown after SL (chop filters remain ON) ---
+        _append_trade({
+            "time": _now_iso_utc(),
+            "symbol": SYMBOL,
+            "side": st.side,
+            "entry": float(st.entry_price or st.entry_ref),
+            "exit": float(ev["price"]),
+            "sl": float(st.stop_px),
+            "tp1": float(st.tp1_px),
+            "tp2": float(st.tp2_px),
+            "result": ev["event"],
+            "tf": "5m",
+            "source": "live"
+        })
+
+        # mode-based cooldown after SL
         if ev["event"] == "SL":
             refresh_ai_mode(context, announce=False)
             mode = AI_STATE["mode"]
             if mode == "CAUTIOUS": cd_min = COOLDOWN_CAUTIOUS_MIN
             elif mode == "AGGRESSIVE": cd_min = COOLDOWN_AGGR_MIN
             else: cd_min = COOLDOWN_BASELINE_MIN
-
-            now_ms = int(time.time() * 1000)
-            tm.cooldown_until_ms = max(tm.cooldown_until_ms, now_ms + cd_min * 60 * 1000)
+            now_ms = int(time.time()*1000)
+            tm.cooldown_until_ms = max(tm.cooldown_until_ms, now_ms + cd_min*60*1000)
             if ADMIN_CHAT_ID:
-                context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=f"⏳ Cooldown set to {cd_min} min (AI mode: {mode}; chop filters still ON).",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⏳ Cooldown set to {cd_min} min (AI mode: {mode}; chop filters still ON).")
 
+# ----------------- session & recaps -----------------
 _last_session_sent = {"LONDON": None, "NY": None}
 def session_commentary(context: CallbackContext):
     import pytz
@@ -449,29 +458,25 @@ def daily_recap(context: CallbackContext):
     if not ADMIN_CHAT_ID: return
     today = datetime.now().strftime("%Y-%m-%d")
     context.bot.send_message(chat_id=ADMIN_CHAT_ID,
-                             text=(f"📅 *Daily Recap — {today}*\n"
-                                   f"Asia: context logged • London/NY: commentary posted\n"
-                                   f"Trades: check logs.\n"
-                                   f"🔥 One clean kill > many messy shots."),
-                             parse_mode=ParseMode.MARKDOWN)
+        text=(f"📅 <b>Daily Recap — {today}</b>\nAsia: context logged • London/NY: commentary posted\nTrades: check logs.\n🔥 One clean kill > many messy shots."),
+        parse_mode=ParseMode.HTML)
 
 def weekly_recap(context: CallbackContext):
     if not ADMIN_CHAT_ID: return
     context.bot.send_message(chat_id=ADMIN_CHAT_ID,
-                             text="📆 *Weekly Recap*\nWins/Losses, EV improvements, chop avoidance, and session chains summarised. Keep sniping ⚔️",
-                             parse_mode=ParseMode.MARKDOWN)
+        text="📆 <b>Weekly Recap</b>\nWins/Losses, EV improvements, chop avoidance, and session chains summarised. Keep sniping ⚔️",
+        parse_mode=ParseMode.HTML)
 
-# ==================== TELEGRAM COMMANDS ====================
+# ----------------- commands -----------------
 @_require_admin
 def cmd_start(update: Update, context: CallbackContext):
-    update.message.reply_text(f"Online. Symbol `{SYMBOL}`. 1-trade lock; risk ${RISK_DOLLARS:.0f}.",
-                              parse_mode=ParseMode.MARKDOWN)
+    update.message.reply_text(f"Online. Symbol `{SYMBOL}`. 1-trade lock; risk ${RISK_DOLLARS:.0f}.", parse_mode=ParseMode.MARKDOWN)
 
 @_require_admin
 def cmd_scan(update: Update, context: CallbackContext):
     try:
         scan_once(context)
-        update.message.reply_text("Scan done.", parse_mode=ParseMode.MARKDOWN)
+        update.message.reply_text("Scan done.")
     except Exception as e:
         update.message.reply_text(f"Scan error: {e}")
 
@@ -488,48 +493,6 @@ def cmd_status(update: Update, context: CallbackContext):
     update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 @_require_admin
-def cmd_daily_now(update: Update, context: CallbackContext):
-    daily_recap(context); update.message.reply_text("Daily recap sent.")
-
-@_require_admin
-def cmd_weekly_now(update: Update, context: CallbackContext):
-    weekly_recap(context); update.message.reply_text("Weekly recap sent.")
-
-@_require_admin
-def cmd_menu(update: Update, context: CallbackContext):
-    commands_text = (
-        "<b>📋 SpiralBot Command Menu</b>\n\n"
-        "<b>/scan</b> — Manually scan market for new signal\n"
-        "<b>/status</b> — Current trade / cooldown\n"
-        "<b>/logs</b> — Show last 30 saved trades (live/backtest)\n"
-        "<b>/backtest [days] [tf]</b> — e.g., <code>/backtest 14 5</code> (writes to logs)\n"
-        "<b>/check_data</b> — Test MEXC data feed\n"
-        "<b>/btdebug [days] [tf]</b> — e.g., <code>/btdebug 7 15</code> (detector counters)\n"
-        "<b>/diag</b> — Data health + cooldown state\n"
-        "<b>/force_unlock</b> — Clear trade lock/cooldown (debug)\n"
-        "<b>/fscheck</b> — Show data dir & trades.json info\n"
-        "<b>/daily_now</b> — Send daily recap now\n"
-        "<b>/weekly_now</b> — Send weekly recap now\n"
-        "<b>/aistats</b> — Show AI mode (Q/M/R/A) & cooldown map\n"
-        "<b>/menu</b> or <b>/help</b> — Show this menu"
-    )
-    update.message.reply_text(commands_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-@_require_admin
-def cmd_help(update: Update, context: CallbackContext):
-    cmd_menu(update, context)
-
-@_require_admin
-def cmd_fscheck(update: Update, context: CallbackContext):
-    try:
-        p = Path(TRADES_PATH)
-        exists = p.exists()
-        size = p.stat().st_size if exists else 0
-        update.message.reply_text(f"DATA_DIR: {DATA_DIR}\nTRADES_PATH: {TRADES_PATH}\nExists: {exists}\nSize: {size} bytes")
-    except Exception as e:
-        update.message.reply_text(f"fscheck error: {e}")
-
-@_require_admin
 def cmd_check_data(update: Update, context: CallbackContext):
     try:
         df5 = get_klines("5", limit=10, include_partial=True)
@@ -544,24 +507,19 @@ def cmd_check_data(update: Update, context: CallbackContext):
 @_require_admin
 def cmd_backtest(update: Update, context: CallbackContext):
     try:
-        days = 7
-        tf = "5"
+        days = 7; tf = "5"
         if context.args:
             if len(context.args) >= 1:
                 try: days = max(1, min(30, int(context.args[0])))
                 except Exception: pass
             if len(context.args) >= 2 and context.args[1] in ("1","5","15","30","60","1m","5m","15m","30m","1h"):
-                tf = context.args[1].replace("m","")
-                if tf == "1h": tf = "60"
-
+                tf = context.args[1].replace("m","");  tf = "60" if tf=="1h" else tf
         update.message.reply_text(f"⏳ Running backtest for last {days} days on {tf}m...")
         from utils import backtest_strategy
         results = backtest_strategy(days=days, tf=tf)
-
         if not results:
             update.message.reply_text("✅ Backtest complete. No valid setups in the window.")
             return
-
         lines = [f"📊 Backtest Results (last {days} days, {tf}m):"]
         for r in results[-10:]:
             lines.append(f"{r['time']} | {r['symbol']} | {r['side']} @ {r['entry']} SL {r['sl']} TP {r['tp']} → {r['result']}")
@@ -591,15 +549,13 @@ def cmd_logs(update: Update, context: CallbackContext):
 @_require_admin
 def cmd_btdebug(update: Update, context: CallbackContext):
     try:
-        days = 7
-        tf = "5"
+        days = 7; tf = "5"
         if context.args:
             if len(context.args) >= 1:
                 try: days = max(1, min(30, int(context.args[0])))
                 except Exception: pass
             if len(context.args) >= 2 and context.args[1] in ("1","5","15","30","60","1m","5m","15m","30m","1h"):
-                tf = context.args[1].replace("m","")
-                if tf == "1h": tf = "60"
+                tf = context.args[1].replace("m",""); tf = "60" if tf=="1h" else tf
         from utils import backtest_strategy_debug
         d = backtest_strategy_debug(days=days, tf=tf)
         msg = (
@@ -628,14 +584,12 @@ def cmd_diag(update: Update, context: CallbackContext):
             parts.append("1m: ❌ no data")
         else:
             ts1 = safe_utc(df1.index[-1]); parts.append(f"1m: {len(df1)} bars (last {ts1.isoformat()})")
-
         if tm.active and not tm.active.closed:
             st = tm.active
             parts.append(f"Active: {st.id} {st.side} @ {st.entry_ref:.2f} SL {st.stop_px:.2f} TP1 {st.tp1_px:.2f} TP2 {st.tp2_px:.2f}")
         else:
             left_ms = max(0, tm.cooldown_until_ms - int(time.time()*1000))
             parts.append(f"No active trade. Cooldown: {left_ms//1000}s")
-
         update.message.reply_text(" • ".join(parts))
     except Exception as e:
         update.message.reply_text(f"diag error: {e}")
@@ -672,42 +626,33 @@ def error_handler(update: object, context: CallbackContext):
     except Exception:
         pass
 
-# ==================== PTB v13 BOOTSTRAP (NO POLLING) ====================
+# ----------------- PTB bootstrap (no polling) -----------------
 updater = Updater(TOKEN, use_context=True)
 dp = updater.dispatcher
 jq = updater.job_queue
 
-# Register handlers
 dp.add_handler(CommandHandler("start",        cmd_start))
 dp.add_handler(CommandHandler("scan",         cmd_scan))
 dp.add_handler(CommandHandler("status",       cmd_status))
-dp.add_handler(CommandHandler("daily_now",    cmd_daily_now))
-dp.add_handler(CommandHandler("weekly_now",   cmd_weekly_now))
 dp.add_handler(CommandHandler("check_data",   cmd_check_data))
 dp.add_handler(CommandHandler("backtest",     cmd_backtest))
 dp.add_handler(CommandHandler("logs",         cmd_logs))
-dp.add_handler(CommandHandler("menu",         cmd_menu))
-dp.add_handler(CommandHandler("help",         cmd_help))
-dp.add_handler(CommandHandler("aistats",      cmd_aistats))
-# Debug
 dp.add_handler(CommandHandler("btdebug",      cmd_btdebug))
 dp.add_handler(CommandHandler("diag",         cmd_diag))
 dp.add_handler(CommandHandler("force_unlock", cmd_force_unlock))
-dp.add_handler(CommandHandler("fscheck",      cmd_fscheck))
+dp.add_handler(CommandHandler("aistats",      cmd_aistats))
 dp.add_error_handler(error_handler)
 
-# Schedule jobs (apscheduler needs pytz tz)
-jq.run_repeating(manage_once,         interval=60,     first=10)
-jq.run_repeating(scan_once,           interval=120,    first=15)
-jq.run_repeating(session_commentary,  interval=60*30,  first=30)
+# jobs
+jq.run_repeating(manage_once,         interval=60,  first=10)
+jq.run_repeating(scan_once,           interval=60,  first=15)  # was 120
+jq.run_repeating(session_commentary,  interval=60*30, first=30)
 jq.run_repeating(lambda ctx: refresh_ai_mode(ctx, announce=True), interval=300, first=10)
 jq.run_daily(daily_recap,  time=dtime(17,  0, 0, tzinfo=UTC))
 jq.run_daily(weekly_recap, time=dtime(17, 30, 0, tzinfo=UTC), days=(6,))
-
-# Start JobQueue in webhook mode
 jq.start()
 
-# ==================== FLASK WEBHOOK ====================
+# ----------------- Flask webhook -----------------
 app = Flask(__name__)
 
 def setup_webhook_once():
@@ -716,10 +661,8 @@ def setup_webhook_once():
     if not host or not token:
         return
     url = f"https://{host}/{token}"
-    try:
-        updater.bot.delete_webhook()
-    except Exception:
-        pass
+    try: updater.bot.delete_webhook()
+    except Exception: pass
     updater.bot.set_webhook(url=url)
 
 setup_webhook_once()
