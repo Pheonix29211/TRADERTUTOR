@@ -1,14 +1,15 @@
-# --- Telegram bot stack (v13) ---
+# --- Telegram bot stack (v13.x, sync) ---
 python-telegram-bot==13.15
+APScheduler==3.6.3
+tornado==6.1          # PTB 13 requires >=6.1; 6.1 is the safest pin
 
 # --- Web server / webhook ---
 Flask==3.0.3
 gunicorn==21.2.0
 
-# --- Scheduling / timezones ---
-APScheduler==3.10.4
+# --- Time & tz helpers (used by APScheduler and our code) ---
 pytz==2024.1
-tzlocal==5.2
+tzlocal==2.1          # APScheduler 3.6.x works best with tzlocal 2.x
 six==1.16.0
 
 # --- Data / math ---
@@ -21,7 +22,7 @@ requests==2.32.3
 # --- Env vars ---
 python-dotenv==1.0.1
 
-# --- Flask deps (pinned for stability) ---
+# --- Flask deps (explicit pins for stability) ---
 Jinja2==3.1.4
 Werkzeug==3.0.3
 itsdangerous==2.1.2
