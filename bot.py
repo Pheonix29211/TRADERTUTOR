@@ -3,12 +3,13 @@
 # Features:
 # - MEXC-only data feed (mexc_client.py)
 # - AI-mode (Q/M/R) with hysteresis; mode-based cooldown after SL
-# - Baseline detector slightly loosened; also scans 15m if 5m has no signal
-# - Scan cadence 60s (manage cadence 60s)
-# - One-trade lock, SL=$40 P&L (stretch to $50 only on high conf), TP1=±$600, TP2=±$1500
-# - Single, full entry message with setup details; live logging to /data/trades.json
+# - Looser BASELINE & AGGRESSIVE selection gates (more entries; risk unchanged)
+# - Scans 5m (primary) and 15m (fallback); larger context windows
+# - Scan cadence 30s (manage cadence 30s)
+# - One-trade lock, SL=$40 P&L (stretch to $50 on high conf), TP1=±$600, TP2=±$1500
+# - Single, full entry message; live logging to /data/trades.json
 # - Session commentary + daily/weekly recaps
-# - HTML-safe messages (no Telegram parse errors)
+# - Safe Telegram sends (TLS retry) + /menu command fixed
 # - Flask webhook; no polling
 
 import os, sys, traceback, time, json, math
@@ -26,6 +27,7 @@ import pandas as pd
 
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.utils.request import Request  # TLS-hardened small pool
 
 from config import (
     TOKEN, ADMIN_CHAT_ID, TZ_NAME, SYMBOL,
@@ -92,6 +94,30 @@ def safe_utc(ts):
     except Exception:
         return ts
 
+def _is_tls_hiccup(err: Exception) -> bool:
+    s = str(err).lower()
+    return ("decryption_failed" in s) or ("bad record mac" in s)
+
+def safe_send(context: CallbackContext, **kw):
+    for i in range(3):
+        try:
+            return context.bot.send_message(**kw)
+        except Exception as e:
+            if _is_tls_hiccup(e):
+                time.sleep(0.6 * (i + 1))
+                continue
+            raise
+
+def safe_reply(update: Update, **kw):
+    for i in range(3):
+        try:
+            return update.message.reply_text(**kw)
+        except Exception as e:
+            if _is_tls_hiccup(e):
+                time.sleep(0.6 * (i + 1))
+                continue
+            raise
+
 def _is_admin(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
     if not ADMIN_CHAT_ID or str(ADMIN_CHAT_ID).strip() in ("", "0", "None"):
@@ -101,7 +127,7 @@ def _is_admin(update: Update) -> bool:
 def _require_admin(func):
     def wrapper(update: Update, context: CallbackContext, *a, **kw):
         if not _is_admin(update):
-            try: update.message.reply_text("Access denied.")
+            try: safe_reply(update, text="Access denied.")
             except Exception: pass
             return
         return func(update, context, *a, **kw)
@@ -223,27 +249,27 @@ def refresh_ai_mode(context: CallbackContext = None, announce: bool = True):
             if mode == "CAUTIOUS":
                 spec = f"disp +15%, fvg +10%, return −5%, gate +0.07; cooldown={COOLDOWN_CAUTIOUS_MIN}m"
             elif mode == "AGGRESSIVE":
-                spec = f"disp −15%, fvg −12%, return +8%, gate −0.05; cooldown={COOLDOWN_AGGR_MIN}m"
+                spec = f"disp −20%, fvg −18%, return +20%, gate −0.10; cooldown={COOLDOWN_AGGR_MIN}m"
             else:
-                spec = f"baseline eased: disp −12%, fvg −10%, return +10%, gate −0.06; cooldown={COOLDOWN_BASELINE_MIN}m"
-            context.bot.send_message(chat_id=ADMIN_CHAT_ID,
-                                     text=f"🧠 AI Mode: {mode} (A={A:.2f}) — {spec}",
-                                     parse_mode=ParseMode.MARKDOWN)
+                spec = f"baseline: disp −20%, fvg −15%, return +15%, gate −0.09; cooldown={COOLDOWN_BASELINE_MIN}m"
+            safe_send(context, chat_id=ADMIN_CHAT_ID,
+                      text=f"🧠 AI Mode: {mode} (A={A:.2f}) — {spec}",
+                      parse_mode=ParseMode.MARKDOWN)
     except Exception:
         pass
 
 def _current_tuning() -> Dict[str, float]:
     """
     Tuning multipliers for detector thresholds.
-    BASELINE intentionally loosened to increase entry frequency a bit.
     """
     m = AI_STATE["mode"]
     if m == "CAUTIOUS":
         return {"disp_mult": 1.15, "fvg_mult": 1.10, "return_mult": 0.95, "conf_adj": +0.07}
     if m == "AGGRESSIVE":
-        return {"disp_mult": 0.85, "fvg_mult": 0.88, "return_mult": 1.08, "conf_adj": -0.05}
-    # BASELINE — slightly looser now
-    return {"disp_mult": 0.88, "fvg_mult": 0.90, "return_mult": 1.10, "conf_adj": -0.06}
+        # a touch looser so Aggressive fires more often
+        return {"disp_mult": 0.80, "fvg_mult": 0.82, "return_mult": 1.20, "conf_adj": -0.10}
+    # BASELINE — one notch looser for more entries
+    return {"disp_mult": 0.80, "fvg_mult": 0.85, "return_mult": 1.15, "conf_adj": -0.09}
 
 # ----------------- P&L → price distances -----------------
 def _dist_from_pnl_usd(pnl_usd: float, qty_btc: float) -> float:
@@ -283,7 +309,6 @@ def _commentary_trade_event(st: TradeState, event: str, px: float) -> str:
 
 # ----------------- core loops -----------------
 def _full_setup_text(sig: Signal) -> str:
-    """Builds extra setup lines if available on the signal."""
     try:
         meta = getattr(sig, "meta", {}) or {}
         sweep = meta.get("swept_level") or getattr(sig, "swept_level", None)
@@ -304,13 +329,12 @@ def _full_setup_text(sig: Signal) -> str:
         return "Pattern: sweep → displacement → FVG return"
 
 def scan_once(context: CallbackContext):
-    # Refresh AI mode for current tuning
     refresh_ai_mode(context, announce=False)
-
     if tm.active and not tm.active.closed:
         return
 
-    df5 = get_klines("5", limit=500, include_partial=False)
+    # Larger windows, still within API limits
+    df5  = get_klines("5",  limit=800, include_partial=False)
     if df5 is None or len(df5) < 210:
         return
 
@@ -322,7 +346,7 @@ def scan_once(context: CallbackContext):
 
     # If no 5m signal, try 15m
     if not sig:
-        df15 = get_klines("15", limit=400, include_partial=False)
+        df15 = get_klines("15", limit=600, include_partial=False)
         if df15 is not None and len(df15) >= 210:
             try:
                 sig = detector.find(df15, bayes, knn, bandit, bans, tuning=tuning)
@@ -368,7 +392,7 @@ def scan_once(context: CallbackContext):
             f"{setup_lines}\n"
             f"Confidence: {_p(getattr(sig,'conf',0.0),2)}"
         )
-        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        safe_send(context, chat_id=ADMIN_CHAT_ID, text=txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 def manage_once(context: CallbackContext):
     if not (tm.active and not tm.active.closed):
@@ -394,20 +418,19 @@ def manage_once(context: CallbackContext):
             prob_sl = 0.35; ev_knn = 0.55; rej_score = 0.1; struct_loss = 0.3; vol_shift = 0.1
             H = 0.32*prob_sl + 0.18*(1-ev_knn) + 0.20*rej_score + 0.12*mae_ratio + 0.12*struct_loss + 0.06*vol_shift
             if H >= ASSISTANT_STRONG:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="🛑 <b>Cut Recommended</b> — risk outweighs hold. Bank discipline now.", parse_mode=ParseMode.HTML)
+                safe_send(context, chat_id=ADMIN_CHAT_ID, text="🛑 <b>Cut Recommended</b> — risk outweighs hold. Bank discipline now.", parse_mode=ParseMode.HTML)
             elif H >= ASSISTANT_CUT:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⚠️ <b>Weakening</b> — EV_exit > EV_hold. Consider partial or exit.", parse_mode=ParseMode.HTML)
+                safe_send(context, chat_id=ADMIN_CHAT_ID, text="⚠️ <b>Weakening</b> — EV_exit > EV_hold. Consider partial or exit.", parse_mode=ParseMode.HTML)
             elif H >= ASSISTANT_WARN:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="ℹ️ <b>Heads-up</b> — momentum softening; tighten BE buffer.", parse_mode=ParseMode.HTML)
+                safe_send(context, chat_id=ADMIN_CHAT_ID, text="ℹ️ <b>Heads-up</b> — momentum softening; tighten BE buffer.", parse_mode=ParseMode.HTML)
         except Exception:
             pass
         return
 
     if ADMIN_CHAT_ID:
-        context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=_commentary_trade_event(st, ev["event"], ev["price"]), parse_mode=ParseMode.MARKDOWN)
+        safe_send(context, chat_id=ADMIN_CHAT_ID, text=_commentary_trade_event(st, ev["event"], ev["price"]), parse_mode=ParseMode.MARKDOWN)
 
     if ev["event"] in ("TP2", "SL", "EARLY_TP2", "TP1", "EARLY_TP1", "CANCELLED"):
-        # close in manager for TP2/SL/EarlyTP2 (others may be partials in your manager)
         if ev["event"] in ("TP2", "SL", "EARLY_TP2"): tm.close(st, ev["event"], ev["price"])
         R = trade_reward(st, ev["event"])
         bandit.update(st.arm_id, norm_reward(R), weight=1.5 if "TP2" in ev["event"] else 1.0)
@@ -436,7 +459,7 @@ def manage_once(context: CallbackContext):
             now_ms = int(time.time()*1000)
             tm.cooldown_until_ms = max(tm.cooldown_until_ms, now_ms + cd_min*60*1000)
             if ADMIN_CHAT_ID:
-                context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⏳ Cooldown set to {cd_min} min (AI mode: {mode}; chop filters still ON).")
+                safe_send(context, chat_id=ADMIN_CHAT_ID, text=f"⏳ Cooldown set to {cd_min} min (AI mode: {mode}; chop filters still ON).")
 
 # ----------------- session & recaps -----------------
 _last_session_sent = {"LONDON": None, "NY": None}
@@ -447,38 +470,55 @@ def session_commentary(context: CallbackContext):
     global _last_session_sent
     if 12 <= h <= 17:
         if _last_session_sent.get("LONDON") != day and ADMIN_CHAT_ID:
-            context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="📈 London in play: likely liquidity engineering. Watch for sweep → displacement. Sniper mode ON 🔥")
+            safe_send(context, chat_id=ADMIN_CHAT_ID, text="📈 London in play: likely liquidity engineering. Watch for sweep → displacement. Sniper mode ON 🔥")
             _last_session_sent["LONDON"] = day
     if 19 <= h <= 23:
         if _last_session_sent.get("NY") != day and ADMIN_CHAT_ID:
-            context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⚡️ NY session: breakout probability elevated. Track displacement legs and FVG returns 🚀")
+            safe_send(context, chat_id=ADMIN_CHAT_ID, text="⚡️ NY session: breakout probability elevated. Track displacement legs and FVG returns 🚀")
             _last_session_sent["NY"] = day
 
 def daily_recap(context: CallbackContext):
     if not ADMIN_CHAT_ID: return
     today = datetime.now().strftime("%Y-%m-%d")
-    context.bot.send_message(chat_id=ADMIN_CHAT_ID,
+    safe_send(context, chat_id=ADMIN_CHAT_ID,
         text=(f"📅 <b>Daily Recap — {today}</b>\nAsia: context logged • London/NY: commentary posted\nTrades: check logs.\n🔥 One clean kill > many messy shots."),
         parse_mode=ParseMode.HTML)
 
 def weekly_recap(context: CallbackContext):
     if not ADMIN_CHAT_ID: return
-    context.bot.send_message(chat_id=ADMIN_CHAT_ID,
+    safe_send(context, chat_id=ADMIN_CHAT_ID,
         text="📆 <b>Weekly Recap</b>\nWins/Losses, EV improvements, chop avoidance, and session chains summarised. Keep sniping ⚔️",
         parse_mode=ParseMode.HTML)
 
 # ----------------- commands -----------------
 @_require_admin
 def cmd_start(update: Update, context: CallbackContext):
-    update.message.reply_text(f"Online. Symbol `{SYMBOL}`. 1-trade lock; risk ${RISK_DOLLARS:.0f}.", parse_mode=ParseMode.MARKDOWN)
+    safe_reply(update, text=f"Online. Symbol `{SYMBOL}`. 1-trade lock; risk ${RISK_DOLLARS:.0f}.", parse_mode=ParseMode.MARKDOWN)
+
+@_require_admin
+def cmd_menu(update: Update, context: CallbackContext):
+    text = (
+        "<b>Menu</b>\n"
+        "/start – Bot online & risk\n"
+        "/aistats – AI mode, Q/M/R, cooldown map\n"
+        "/diag – Data freshness & lock/cooldown\n"
+        "/status – Active trade & levels\n"
+        "/scan – Force a 5m/15m scan now\n"
+        "/backtest <days> [tf] – e.g. /backtest 7 5 or /backtest 30 15\n"
+        "/btdebug <days> [tf] – bars & signals count\n"
+        "/logs – Last logged trades\n"
+        "/check_data – MEXC health\n"
+        "/force_unlock – Clear 1-trade lock & cooldown\n"
+    )
+    safe_reply(update, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 @_require_admin
 def cmd_scan(update: Update, context: CallbackContext):
     try:
         scan_once(context)
-        update.message.reply_text("Scan done.")
+        safe_reply(update, text="Scan done.")
     except Exception as e:
-        update.message.reply_text(f"Scan error: {e}")
+        safe_reply(update, text=f"Scan error: {e}")
 
 @_require_admin
 def cmd_status(update: Update, context: CallbackContext):
@@ -490,19 +530,19 @@ def cmd_status(update: Update, context: CallbackContext):
     else:
         left_ms = max(0, tm.cooldown_until_ms - int(time.time()*1000))
         msg = f"No active trade. Cooldown {left_ms//1000}s."
-    update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    safe_reply(update, text=msg, parse_mode=ParseMode.MARKDOWN)
 
 @_require_admin
 def cmd_check_data(update: Update, context: CallbackContext):
     try:
         df5 = get_klines("5", limit=10, include_partial=True)
         if df5 is None or df5.empty:
-            update.message.reply_text("❌ No data from MEXC.")
+            safe_reply(update, text="❌ No data from MEXC.")
             return
         ts = safe_utc(df5.index[-1])
-        update.message.reply_text(f"✅ MEXC OK. 5m candles: {len(df5)}. Last bar @ {ts.isoformat()}")
+        safe_reply(update, text=f"✅ MEXC OK. 5m candles: {len(df5)}. Last bar @ {ts.isoformat()}")
     except Exception as e:
-        update.message.reply_text(f"❌ MEXC error: {e}")
+        safe_reply(update, text=f"❌ MEXC error: {e}")
 
 @_require_admin
 def cmd_backtest(update: Update, context: CallbackContext):
@@ -514,24 +554,24 @@ def cmd_backtest(update: Update, context: CallbackContext):
                 except Exception: pass
             if len(context.args) >= 2 and context.args[1] in ("1","5","15","30","60","1m","5m","15m","30m","1h"):
                 tf = context.args[1].replace("m","");  tf = "60" if tf=="1h" else tf
-        update.message.reply_text(f"⏳ Running backtest for last {days} days on {tf}m...")
+        safe_reply(update, text=f"⏳ Running backtest for last {days} days on {tf}m...")
         from utils import backtest_strategy
         results = backtest_strategy(days=days, tf=tf)
         if not results:
-            update.message.reply_text("✅ Backtest complete. No valid setups in the window.")
+            safe_reply(update, text="✅ Backtest complete. No valid setups in the window.")
             return
         lines = [f"📊 Backtest Results (last {days} days, {tf}m):"]
         for r in results[-10:]:
             lines.append(f"{r['time']} | {r['symbol']} | {r['side']} @ {r['entry']} SL {r['sl']} TP {r['tp']} → {r['result']}")
-        update.message.reply_text("\n".join(lines))
+        safe_reply(update, text="\n".join(lines))
     except Exception as e:
-        update.message.reply_text(f"⚠️ Backtest failed: {e}")
+        safe_reply(update, text=f"⚠️ Backtest failed: {e}")
 
 @_require_admin
 def cmd_logs(update: Update, context: CallbackContext):
     trades = _read_trades_safe()
     if not trades:
-        update.message.reply_text("No saved trades yet.")
+        safe_reply(update, text="No saved trades yet.")
         return
     lines = ["🧾 Last trades:"]
     for t in trades[-10:]:
@@ -544,7 +584,7 @@ def cmd_logs(update: Update, context: CallbackContext):
         tf   = t.get("tf","")
         tf_s = f" [{tf}]" if tf else ""
         lines.append(f"{when} | {sym}{tf_s} | {side} @ {ent} → {res} ({src})")
-    update.message.reply_text("\n".join(lines))
+    safe_reply(update, text="\n".join(lines))
 
 @_require_admin
 def cmd_btdebug(update: Update, context: CallbackContext):
@@ -566,14 +606,14 @@ def cmd_btdebug(update: Update, context: CallbackContext):
             f"First bar: {d.get('first_ts')}\n"
             f"Last bar: {d.get('last_ts')}\n"
         )
-        update.message.reply_text(msg)
+        safe_reply(update, text=msg)
     except Exception as e:
-        update.message.reply_text(f"btdebug error: {e}")
+        safe_reply(update, text=f"btdebug error: {e}")
 
 @_require_admin
 def cmd_diag(update: Update, context: CallbackContext):
     try:
-        df5 = get_klines("5", limit=500, include_partial=False)
+        df5 = get_klines("5", limit=800, include_partial=False)
         df1 = get_klines("1", limit=120, include_partial=True)
         parts = []
         if df5 is None or df5.empty:
@@ -590,9 +630,9 @@ def cmd_diag(update: Update, context: CallbackContext):
         else:
             left_ms = max(0, tm.cooldown_until_ms - int(time.time()*1000))
             parts.append(f"No active trade. Cooldown: {left_ms//1000}s")
-        update.message.reply_text(" • ".join(parts))
+        safe_reply(update, text=" • ".join(parts))
     except Exception as e:
-        update.message.reply_text(f"diag error: {e}")
+        safe_reply(update, text=f"diag error: {e}")
 
 @_require_admin
 def cmd_force_unlock(update: Update, context: CallbackContext):
@@ -600,9 +640,9 @@ def cmd_force_unlock(update: Update, context: CallbackContext):
         tm.cooldown_until_ms = 0
         if tm.active and tm.active.closed:
             tm.active = None
-        update.message.reply_text("🔓 Trade lock & cooldown cleared.")
+        safe_reply(update, text="🔓 Trade lock & cooldown cleared.")
     except Exception as e:
-        update.message.reply_text(f"force_unlock error: {e}")
+        safe_reply(update, text=f"force_unlock error: {e}")
 
 @_require_admin
 def cmd_aistats(update: Update, context: CallbackContext):
@@ -614,24 +654,26 @@ def cmd_aistats(update: Update, context: CallbackContext):
                f"Mode: {s['mode']} (A={s['A']:.2f}), hold ≥{AI_MODE_HOLD_MIN}m (≈{mins_left}m left)\n"
                f"Q={s['Q']:.2f} (quality) • M={s['M']:.2f} (regime) • R={s['R']:.2f} (risk pressure)\n"
                f"Cooldown map → Caut:{COOLDOWN_CAUTIOUS_MIN}m | Base:{COOLDOWN_BASELINE_MIN}m | Aggr:{COOLDOWN_AGGR_MIN}m")
-        update.message.reply_text(msg)
+        safe_reply(update, text=msg)
     except Exception as e:
-        update.message.reply_text(f"aistats error: {e}")
+        safe_reply(update, text=f"aistats error: {e}")
 
 def error_handler(update: object, context: CallbackContext):
     try:
         msg = f"Error: {context.error}\n{traceback.format_exc()[:900]}"
         if ADMIN_CHAT_ID:
-            context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg)
+            safe_send(context, chat_id=ADMIN_CHAT_ID, text=msg)
     except Exception:
         pass
 
 # ----------------- PTB bootstrap (no polling) -----------------
-updater = Updater(TOKEN, use_context=True)
+req = Request(con_pool_size=1, connect_timeout=20, read_timeout=20)
+updater = Updater(TOKEN, use_context=True, request=req)
 dp = updater.dispatcher
 jq = updater.job_queue
 
 dp.add_handler(CommandHandler("start",        cmd_start))
+dp.add_handler(CommandHandler("menu",         cmd_menu))
 dp.add_handler(CommandHandler("scan",         cmd_scan))
 dp.add_handler(CommandHandler("status",       cmd_status))
 dp.add_handler(CommandHandler("check_data",   cmd_check_data))
@@ -643,9 +685,9 @@ dp.add_handler(CommandHandler("force_unlock", cmd_force_unlock))
 dp.add_handler(CommandHandler("aistats",      cmd_aistats))
 dp.add_error_handler(error_handler)
 
-# jobs
-jq.run_repeating(manage_once,         interval=60,  first=10)
-jq.run_repeating(scan_once,           interval=60,  first=15)  # was 120
+# jobs (30s cadence for more responsiveness)
+jq.run_repeating(manage_once,         interval=30,  first=10)
+jq.run_repeating(scan_once,           interval=30,  first=15)
 jq.run_repeating(session_commentary,  interval=60*30, first=30)
 jq.run_repeating(lambda ctx: refresh_ai_mode(ctx, announce=True), interval=300, first=10)
 jq.run_daily(daily_recap,  time=dtime(17,  0, 0, tzinfo=UTC))

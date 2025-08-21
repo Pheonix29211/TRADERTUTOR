@@ -1,8 +1,8 @@
 # utils.py
 # Backtest utilities:
 # - Uses mexc_client.get_klines_between with robust paging
-# - Lock-free simulation windows (so you see all signals)
-# - Baseline tuning matches live (slightly loosened)
+# - Lock-free simulation windows
+# - BASELINE tuning matches live (looser for more entries)
 # - SL from P&L dollars (qty); TP1/TP2 from price points
 # - Results appended to /data/trades.json for /logs
 
@@ -85,8 +85,8 @@ def _utc_now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 def _baseline_tuning():
-    # Match bot.py's BASELINE → slightly looser
-    return {"disp_mult": 0.88, "fvg_mult": 0.90, "return_mult": 1.10, "conf_adj": -0.06}
+    # Match bot.py BASELINE (looser for more entries)
+    return {"disp_mult": 0.80, "fvg_mult": 0.85, "return_mult": 1.15, "conf_adj": -0.09}
 
 def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
     end_utc = _utc_now()
@@ -102,7 +102,7 @@ def backtest_strategy(days: int = 7, tf: str = "5") -> List[Dict[str, Any]]:
 
     tf_minutes = {"1":"1","5":"5","15":"15","30":"30","60":"60"}.get(tf, "5")
     tfm = int(tf_minutes)
-    look_bars = max(12, int(8 * 60 / tfm))  # 8h
+    look_bars = max(12, int(8 * 60 / tfm))  # 8h window
 
     risk_dist = RISK_DOLLARS / max(1e-9, QTY_BTC)
     tp1_dist  = TP1_POINTS
